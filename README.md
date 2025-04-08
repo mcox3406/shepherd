@@ -6,7 +6,7 @@ Note that *ShEPhERD* has a sister repository, [shepherd-score](https://github.co
 The preprint can be found on arXiv: [ShEPhERD: Diffusing shape, electrostatics, and pharmacophores for bioisosteric drug design](https://arxiv.org/abs/2411.04130)
 
 <p align="center">
-  <img width="400" src="./shepherd_logo.svg">
+  <img width="400" src="./docs/images/shepherd_logo.svg">
 </p>
 
 <sub><sup>1</sup> **ShEPhERD**: **S**hape, **E**lectrostatics, and **Ph**armacophores **E**xplicit **R**epresentation **D**iffusion</sub>
@@ -20,6 +20,8 @@ The preprint can be found on arXiv: [ShEPhERD: Diffusing shape, electrostatics, 
 6. [Evaluations](##evaluations)
 
 ## File Structure
+
+THIS IS NO LONGER ACCURATE AFTER I (MATTHEW) REFACTORED! But still a good reference, can update if these changes ever make it to main repo
 
 ```
 .
@@ -52,39 +54,31 @@ The preprint can be found on arXiv: [ShEPhERD: Diffusing shape, electrostatics, 
 
 `environment.yml` contains the conda environment that we used for training and running *ShEPhERD*. 
 
-**We** followed these steps to create a suitable conda environment, which worked on our Linux system. Please note that this exact installation procedure may depend on your system, particularly your cuda version.
+**We** followed these steps to create a suitable conda environment, which worked on our Linux system. Please note that this exact installation procedure may depend on your system, particularly your cuda version. On MIT SuperCloud, the following works:
 
 ```
-conda create --name shepherd python=3.8.13
-source activate shepherd
-conda install merv::envvar-pythonnousersite-true
-source deactivate
+# MIT SUPERCLOUD INSTRUCTIONS
 
-source activate shepherd
+# get the ML packages necessary
+module load anaconda/Python-ML-2025a
 
-conda config --append channels conda-forge
+# the above gives access to standard ML packages like torch v2.5.1
+# most people will need to also do e.g.
+# https://pytorch.org/get-started/previous-versions/
+# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 
-pip cache purge
-pip3 cache purge
-export TMPDIR='/var/tmp'
 
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit==11.3.1 -c pytorch
-conda install pyg=2.2.0 -c pyg
+# https://pytorch-geometric.readthedocs.io/en/1.6.3/notes/installation.html
+pip install --user torch-scatter -f https://pytorch-geometric.com/whl/torch-2.5.1+124.html
+pip install --user torch-sparse -f https://pytorch-geometric.com/whl/torch-2.5.1+124.html
+pip install --user torch-cluster -f https://pytorch-geometric.com/whl/torch-2.5.1+124.html
+pip install --user torch-spline-conv -f https://pytorch-geometric.com/whl/torch-2.5.1+124.html
+pip install --user torch-geometric
 
-pip install e3nn
-
-pip install jupyterlab
-
-pip install pip==24.0
-pip install pytorch-lightning==1.6.3
-pip install setuptools==59.5.0
-
-pip install rdkit
-conda install xtb
-pip install open3d
-conda install h5py
-
-pip install numpy --upgrade
+# other dependencies
+pip install --user rdkit
+pip install --user xtb
+pip install --user open3d
 ```
 
 
