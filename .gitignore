@@ -1,7 +1,7 @@
 inference_scaling/
 
 # macOS
-.DS_Store
+*.DS_Store
 
 # data files generated
 *.txt
