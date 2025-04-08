@@ -15,6 +15,6 @@ setup(
         "rdkit",
         "e3nn",
         "open3d",
-        "xtb-python"
+        "xtb"
     ],
 )

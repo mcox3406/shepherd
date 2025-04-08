@@ -9,10 +9,9 @@ Requires-Dist: torch
 Requires-Dist: torch-geometric
 Requires-Dist: pytorch-lightning
 Requires-Dist: rdkit
-Requires-Dist: open3d
 Requires-Dist: e3nn
-Requires-Dist: numpy
-Requires-Dist: matplotlib
+Requires-Dist: open3d
+Requires-Dist: xtb
 Dynamic: author
 Dynamic: requires-dist
 Dynamic: requires-python

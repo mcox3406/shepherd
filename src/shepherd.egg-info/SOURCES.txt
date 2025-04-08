@@ -11,10 +11,6 @@ src/shepherd.egg-info/SOURCES.txt
 src/shepherd.egg-info/dependency_links.txt
 src/shepherd.egg-info/requires.txt
 src/shepherd.egg-info/top_level.txt
-src/shepherd/inference_scaling/__init__.py
-src/shepherd/inference_scaling/model_runner.py
-src/shepherd/inference_scaling/search_algorithms.py
-src/shepherd/inference_scaling/verifiers.py
 src/shepherd/model/__init__.py
 src/shepherd/model/equiformer_operations.py
 src/shepherd/model/equiformer_v2_encoder.py
@@ -92,7 +88,3 @@ src/shepherd/shepherd_score_utils/generate_point_cloud.py
 src/shepherd/shepherd_score_utils/pharm_utils/__init__.py
 src/shepherd/shepherd_score_utils/pharm_utils/pharmacophore.py
 src/shepherd/shepherd_score_utils/pharm_utils/pharmvec.py
-tests/test_integration.py
-tests/test_model_runner.py
-tests/test_search_algorithms.py
-tests/test_verifiers.py
