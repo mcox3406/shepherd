@@ -1,4 +1,5 @@
 inference_scaling/
+basic_inference_results/
 
 # macOS
 *.DS_Store
