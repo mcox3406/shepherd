@@ -1,8 +1,0 @@
-torch
-torch-geometric
-pytorch-lightning
-rdkit
-open3d
-e3nn
-numpy
-matplotlib
