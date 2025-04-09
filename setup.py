@@ -1,20 +1,13 @@
-from setuptools import setup, find_packages
+"""
+Minimal setup.py for backward compatibility.
+For modern package configuration, see pyproject.toml.
+"""
+import setuptools
 
-setup(
-    name="shepherd",
-    version="0.1.0",
-    package_dir={"": "src"},
-    packages=find_packages(where="src"),
-    description="ShEPhERD: Diffusing Shape, Electrostatics, and Pharmacophores for Drug Design",
-    author="Keir Adams and Kento Abeywerdane",
-    python_requires=">=3.8",
-    install_requires=[
-        "torch",
-        "torch-geometric",
-        "pytorch-lightning",
-        "rdkit",
-        "e3nn",
-        "open3d",
-        "xtb-python"
-    ],
-)
+
+if __name__ == "__main__":
+    setuptools.setup(
+        name="shepherd",
+        package_dir={"": "src"},
+        packages=setuptools.find_packages(where="src"),
+    )
