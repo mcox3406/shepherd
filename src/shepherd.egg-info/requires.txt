@@ -1,7 +1,0 @@
-torch
-torch-geometric
-pytorch-lightning
-rdkit
-e3nn
-open3d
-xtb
