@@ -664,8 +664,8 @@ def inference_sample(
         x4_t = t
         
         # harmonize
-        if (harmonize) and (t == harmonize_ts[0]):
-            #print(f'harmonizing... at time {t}')
+        if (harmonize) and (len(harmonize_ts) > 0) and (t == harmonize_ts[0]):
+            print(f'Harmonizing... at time {t}')
             harmonize_ts.pop(0)
             if len(harmonize_ts) == 0:
                 harmonize = False

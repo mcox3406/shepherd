@@ -17,3 +17,5 @@ from .search_algorithms import (
 )
 
 from .model_runner import ShepherdModelRunner
+
+from .utils import create_rdkit_molecule

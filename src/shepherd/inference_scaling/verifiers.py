@@ -12,7 +12,18 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem import RDConfig
+import os
+import sys
 import logging
+
+# turn off RDKit warnings or else you'll be spammed
+# uncomment this if you're testing stuff though
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
+
+from .utils import create_rdkit_molecule
+
 
 class Verifier:
     """Base class for all verifiers."""
@@ -51,35 +62,7 @@ class Verifier:
         Returns:
             rdkit.Chem.rdchem.Mol: RDKit molecule object.
         """
-        # extract atoms and their positions from x1
-        atoms = shepherd_output['x1']['atoms']
-        positions = shepherd_output['x1']['positions']
-        
-        # create an RDKit mol with the atoms and their positions
-        mol = Chem.RWMol()
-        for atom_num, pos in zip(atoms, positions):
-            atom = Chem.Atom(int(atom_num))
-            atom_idx = mol.AddAtom(atom)
-        
-        # set atom positions
-        conf = Chem.Conformer(len(atoms))
-        for i, pos in enumerate(positions):
-            conf.SetAtomPosition(i, pos)
-        mol.AddConformer(conf)
-        
-        # determine bonds based on positions
-        mol = mol.GetMol()
-        mol = Chem.rdmolops.AddHs(mol, addCoords=True)
-        
-        # determine bonds
-        try:
-            mol = Chem.rdDetermineBonds.DetermineBonds(mol, charge=0)
-            mol = Chem.rdmolops.RemoveHs(mol)
-            Chem.SanitizeMol(mol)
-            return mol
-        except Exception as e:
-            logging.warning(f"Error processing molecule: {e}")
-            return None
+        return create_rdkit_molecule(shepherd_output)
 
 
 class SAScoreVerifier(Verifier):
@@ -96,15 +79,24 @@ class SAScoreVerifier(Verifier):
         """
         super().__init__("SA_Score", weight)
         self.target_range = target_range
-        self._sa_model = None
+        self._sascorer = None
         
     def _load_sa_model(self):
         """Load the SA score model if it hasn't been loaded yet."""
-        if self._sa_model is None:
-            import pickle
-            import os
-            from rdkit.Contrib import SA_Score
-            self._sa_contrib = SA_Score
+        if self._sascorer is None:
+            # import sascorer from RDKit contrib directory
+            # https://greglandrum.github.io/rdkit-blog/posts/2023-12-01-using_sascore_and_npscore.html
+            sys.path.append(os.path.join(os.environ['CONDA_PREFIX'],'share','RDKit','Contrib'))
+            try:
+                from SA_Score import sascorer
+                self._sascorer = sascorer
+            except ImportError:
+                try:
+                    from rdkit.Contrib.SA_Score import sascorer
+                    self._sascorer = sascorer
+                except ImportError:
+                    logging.error("Failed to import sascorer from RDKit contrib directory")
+                    raise
             
     def __call__(self, mol_input):
         """
@@ -122,14 +114,12 @@ class SAScoreVerifier(Verifier):
             mol = mol_input
             
         if mol is None:
-            return 0.0  # invalid molecule gets worst score
+            return 0.0
         
         try:
-            # load SA score model if not already loaded
             self._load_sa_model()
             
-            # calculate SA score using RDKit's SA_Score
-            sa_score = self._sa_contrib.calculateScore(mol)
+            sa_score = self._sascorer.calculateScore(mol)
             
             # original SA score is 1 (easy to synthesize) to 10 (hard to synthesize)
             # we want to normalize it to 0-1 where higher is better (more synthesizable)
@@ -137,21 +127,21 @@ class SAScoreVerifier(Verifier):
             # invert and normalize to 0-1
             normalized_score = 1.0 - (sa_score - 1.0) / 9.0  # 1->1, 10->0
             
-            # apply penalty if outside target range
-            min_range, max_range = self.target_range
-            original_range_score = 1.0 - (sa_score - min_range) / (max_range - min_range)
-            if sa_score < min_range:
-                # small penalty for being too easy to synthesize (might be too simple)
-                normalized_score *= 0.9
-            elif sa_score > max_range:
-                # larger penalty for being too hard to synthesize
-                normalized_score *= 0.7
+            # WE MIGHT WANT TO USE THIS TOO (UNCOMMENT IF YOU WANT TO USE IT)
+            # min_range, max_range = self.target_range
+            # original_range_score = 1.0 - (sa_score - min_range) / (max_range - min_range)
+            # if sa_score < min_range:
+            #     # small penalty for being too easy to synthesize (might be too simple)
+            #     normalized_score *= 0.9
+            # elif sa_score > max_range:
+            #     # larger penalty for being too hard to synthesize
+            #     normalized_score *= 0.7
             
             return normalized_score
         
         except Exception as e:
             logging.warning(f"Error calculating SA score: {e}")
-            return 0.0  # return worst score on error
+            return 0.0
 
 
 class CLogPVerifier(Verifier):
@@ -164,10 +154,12 @@ class CLogPVerifier(Verifier):
         Args:
             weight (float): Weight of the verifier in multi-objective optimization.
             target_range (tuple): The ideal range for cLogP values. Values outside
-                                 this range will be penalized.
+                                  this range will be penalized.
         """
         super().__init__("cLogP", weight)
         self.target_range = target_range
+        from rdkit.Chem import Crippen
+        self._crippen = Crippen
         
     def __call__(self, mol_input):
         """
@@ -185,15 +177,12 @@ class CLogPVerifier(Verifier):
             mol = mol_input
             
         if mol is None:
-            return 0.0  # invalid molecule gets worst score
+            return 0.0
         
         try:
-            # calculate logP using RDKit's Crippen method
-            logp = Chem.Crippen.MolLogP(mol)
+            logp = self._crippen.MolLogP(mol)
             
-            # calculate how well the logP fits in our target range
             min_range, max_range = self.target_range
-            
             if min_range <= logp <= max_range:
                 # within range gets full score
                 return 1.0
@@ -210,7 +199,7 @@ class CLogPVerifier(Verifier):
         
         except Exception as e:
             logging.warning(f"Error calculating cLogP: {e}")
-            return 0.0  # return worst score on error
+            return 0.0
 
 
 class MultiObjectiveVerifier(Verifier):
