@@ -141,6 +141,9 @@ def save_results(results, output_path):
         'best_score': results.get('best_score', 0),
         'duration_seconds': results.get('duration_seconds', 0),
         'num_evaluations': len(results.get('scores', [])),
+        'nfe': results.get('nfe', 0),
+        'best_sa_score': results.get('best_sa_score'),
+        'best_clogp_score': results.get('best_clogp_score'),
         'config': results.get('config', {})
     }
     
@@ -383,7 +386,27 @@ def run_experiment(args):
         print(f"Best Score: {best_score:.4f}")
         print(f"Improvement over Baseline: {best_score - baseline_score:.4f} ({(best_score - baseline_score) / baseline_score * 100:.2f}%)")
         print(f"Duration: {duration:.2f} seconds")
-        
+
+        nfe = metadata.get('nfe', 0)
+        print(f"Total Evaluations (NFE): {nfe}")
+
+        best_sa_score = None
+        best_clogp_score = None
+        if best_sample is not None:
+            try:
+                best_sa_score = sa_verifier(best_sample)
+                best_clogp_score = clogp_verifier(best_sample)
+                print(f"Best Individual Scores - SA: {best_sa_score:.4f}, cLogP: {best_clogp_score:.4f}")
+            except Exception as e:
+                logging.warning(f"Could not calculate individual scores for best sample: {e}")
+
+        # update results dictionary with NFE and individual scores
+        results.update({
+            'nfe': nfe,
+            'best_sa_score': best_sa_score,
+            'best_clogp_score': best_clogp_score
+        })
+
         save_results(results, output_path)
         
         if args.plot:

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Analyze and compare inference scaling experiments from ShEPhERD.
 
@@ -19,6 +18,7 @@ import seaborn as sns
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Draw
+import logging
 
 from shepherd.inference_scaling import create_rdkit_molecule
 
@@ -67,6 +67,9 @@ def extract_summary_data(results):
         'improvement_pct': (results.get('best_score', 0) - results.get('baseline_score', 0)) / max(0.0001, results.get('baseline_score', 0)) * 100,
         'duration_seconds': results.get('duration_seconds', 0),
         'num_evaluations': len(results.get('scores', [])),
+        'nfe': results.get('nfe', 0),
+        'best_sa_score': results.get('best_sa_score'),
+        'best_clogp_score': results.get('best_clogp_score'),
     }
     
     # add configuration details
@@ -117,6 +120,11 @@ def create_summary_table(summaries):
             if col in df.columns:
                 display_columns.append(col)
     
+    # add NFE and best individual scores if available
+    for col in ['nfe', 'best_sa_score', 'best_clogp_score']:
+        if col in df.columns:
+            display_columns.append(col)
+    
     # create formatted table
     table = df[display_columns].copy()
     
@@ -129,6 +137,10 @@ def create_summary_table(summaries):
         table['improvement'] = table['improvement'].map('{:.4f}'.format)
     if 'improvement_pct' in table.columns:
         table['improvement_pct'] = table['improvement_pct'].map('{:.2f}%'.format)
+    if 'best_sa_score' in table.columns:
+        table['best_sa_score'] = table['best_sa_score'].map(lambda x: '{:.4f}'.format(x) if pd.notna(x) else 'N/A')
+    if 'best_clogp_score' in table.columns:
+        table['best_clogp_score'] = table['best_clogp_score'].map(lambda x: '{:.4f}'.format(x) if pd.notna(x) else 'N/A')
     if 'duration_seconds' in table.columns:
         # format duration as minutes if > 60 seconds
         table['duration'] = df['duration_seconds'].apply(
@@ -145,7 +157,10 @@ def create_summary_table(summaries):
         'num_steps': 'steps',
         'num_neighbors': 'neighbors',
         'step_size': 'step_size',
-        'improvement_pct': 'improv_%'
+        'improvement_pct': 'improv_%',
+        'nfe': 'NFE',
+        'best_sa_score': 'Best SA',
+        'best_clogp_score': 'Best cLogP'
     }
     table = table.rename(columns=rename_map)
     
@@ -268,6 +283,87 @@ def draw_best_molecules(summaries, output_dir):
     print(f"Best molecules image saved to {output_dir}/best_molecules.png")
 
 
+def plot_nfe_comparisons(experiments, results_dict, output_dir):
+    """Create plots comparing performance metrics against NFE."""
+    logging.info("Plotting performance vs. NFE...")
+    
+    # prepare data
+    plot_data = []
+    for exp_name in experiments:
+        results = results_dict.get(exp_name)
+        if not results or 'nfe' not in results or results['nfe'] <= 0:
+            logging.warning(f"Skipping NFE plot for {exp_name}, missing NFE data.")
+            continue
+        
+        improvement = results.get('best_score', 0) - results.get('baseline_score', 0)
+        
+        plot_data.append({
+            'experiment': exp_name,
+            'algorithm': results.get('algorithm', 'unknown'),
+            'nfe': results['nfe'],
+            'best_combined': results.get('best_score'),
+            'best_sa': results.get('best_sa_score'),
+            'best_clogp': results.get('best_clogp_score'),
+            'improvement': improvement
+        })
+        
+    if not plot_data:
+        logging.warning("No valid data found for NFE comparison plots.")
+        return
+        
+    df_plot = pd.DataFrame(plot_data)
+    
+    # define metrics to plot against NFE
+    metrics = {
+        'best_combined': 'Best Combined Score',
+        'best_sa': 'Best SA Score',
+        'best_clogp': 'Best cLogP Score',
+        'improvement': 'Score Improvement over Baseline'
+    }
+    
+    # create plots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+    
+    algo_styles = {
+        'random': {'marker': 'o', 'color': 'blue'},
+        'zero_order': {'marker': 's', 'color': 'green'},
+        'guided': {'marker': '^', 'color': 'red'},
+        'unknown': {'marker': 'x', 'color': 'gray'}
+    }
+
+    for i, (metric_key, metric_label) in enumerate(metrics.items()):
+        ax = axes[i]
+        if metric_key not in df_plot.columns or df_plot[metric_key].isnull().all():
+            logging.warning(f"Skipping plot for {metric_label} due to missing data.")
+            ax.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{metric_label} vs. NFE')
+            continue
+
+        # plot each algorithm separately to assign legend labels correctly
+        for algo in df_plot['algorithm'].unique():
+            df_algo = df_plot[df_plot['algorithm'] == algo]
+            style = algo_styles.get(algo, algo_styles['unknown'])
+            ax.scatter(df_algo['nfe'], df_algo[metric_key],
+                       label=algo, marker=style['marker'], color=style['color'], 
+                       alpha=0.8, s=50)
+        
+        ax.set_title(f'{metric_label} vs. NFE')
+        ax.set_xlabel('Number of Function Evaluations (NFE)')
+        ax.set_ylabel(metric_label)
+        ax.grid(True, alpha=0.4)
+        ax.legend(title="Algorithm")
+        # ax.set_xscale('log') 
+
+    plt.tight_layout()
+    # plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    # fig.suptitle('Performance vs. Computational Cost (NFE)', fontsize=16, y=0.99)
+    plot_path = output_dir / "performance_vs_nfe.png"
+    plt.savefig(plot_path)
+    plt.close(fig)
+    logging.info(f"Saved Performance vs. NFE comparison plot to {plot_path}")
+
+
 def analyze_experiments(args):
     """Analyze inference scaling experiments"""
     base_dir = Path(args.base_dir)
@@ -332,6 +428,9 @@ def analyze_experiments(args):
     
     # plot score comparison
     plot_score_comparison(list(results_dict.keys()), results_dict, output_dir)
+    
+    # plot NFE comparisons
+    plot_nfe_comparisons(list(results_dict.keys()), results_dict, output_dir)
     
     # draw best molecules if requested
     if args.draw_molecules:

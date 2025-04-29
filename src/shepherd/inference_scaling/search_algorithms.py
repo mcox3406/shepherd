@@ -72,6 +72,7 @@ class RandomSearch(SearchAlgorithm):
         best_sample = None
         scores = []
         times = []
+        nfe_count = 0
         
         if verbose:
             iterator = tqdm(range(num_trials), desc="Random Search")
@@ -86,6 +87,7 @@ class RandomSearch(SearchAlgorithm):
             
             # evaluate sample
             score = self.verifier(sample)
+            nfe_count += 1
             scores.append(score)
             
             # update best
@@ -104,7 +106,8 @@ class RandomSearch(SearchAlgorithm):
         metadata = {
             "mean_time_per_trial": np.mean(times),
             "total_time": sum(times),
-            "num_trials": num_trials
+            "num_trials": num_trials,
+            "nfe": nfe_count
         }
         
         return best_sample, best_score, scores, metadata
@@ -148,10 +151,12 @@ class ZeroOrderSearch(SearchAlgorithm):
         Returns:
             tuple: (best_sample, best_score, scores_history, metadata)
         """
+        nfe_count = 0
         if init_noise is None:
             # get a random noise vector from the model_runner
             init_sample = self.model_runner()
             init_score = self.verifier(init_sample)
+            nfe_count += 1
             pivot_noise = self.model_runner.get_last_noise()
             pivot_sample = init_sample
             pivot_score = init_score
@@ -159,6 +164,7 @@ class ZeroOrderSearch(SearchAlgorithm):
             pivot_noise = init_noise
             pivot_sample = self.model_runner(noise=pivot_noise)
             pivot_score = self.verifier(pivot_sample)
+            nfe_count += 1
         
         # track best sample and score across all iterations
         best_sample = pivot_sample
@@ -190,10 +196,11 @@ class ZeroOrderSearch(SearchAlgorithm):
                 
                 # evaluate sample
                 neighbor_score = self.verifier(neighbor_sample)
+                nfe_count += 1
                 
                 neighbor_samples.append(neighbor_sample)
                 neighbor_scores.append(neighbor_score)
-                neighbor_noises.append(neighbor_noise) # Use the input noise
+                neighbor_noises.append(neighbor_noise)
                 
                 # call callback for this specific neighbor evaluation
                 if callback is not None:
@@ -229,7 +236,8 @@ class ZeroOrderSearch(SearchAlgorithm):
             "total_time": sum(times),
             "num_steps": num_steps,
             "num_neighbors": num_neighbors,
-            "step_size": step_size
+            "step_size": step_size,
+            "nfe": nfe_count
         }
         
         return best_sample, best_score, scores, metadata
@@ -272,6 +280,7 @@ class GuidedSearch(SearchAlgorithm):
         Returns:
             tuple: (best_sample, best_score, scores_history, metadata)
         """
+        nfe_count = 0
         # initialize population
         population = []
         scores = []
@@ -282,6 +291,7 @@ class GuidedSearch(SearchAlgorithm):
         for i in range(pop_size):
             sample = self.model_runner()
             score = self.verifier(sample)
+            nfe_count += 1
             noise = self.model_runner.get_last_noise()
             
             population.append((sample, noise, score))
@@ -335,7 +345,8 @@ class GuidedSearch(SearchAlgorithm):
                 # generate sample with the new noise
                 new_sample = self.model_runner(noise=new_noise)
                 new_score = self.verifier(new_sample)
-                new_noise_saved = self.model_runner.get_last_noise() # Save the actual noise used
+                nfe_count += 1
+                new_noise_saved = self.model_runner.get_last_noise()
                 
                 new_population.append((new_sample, new_noise_saved, new_score))
 
@@ -368,7 +379,8 @@ class GuidedSearch(SearchAlgorithm):
             "num_generations": num_generations,
             "population_size": pop_size,
             "mutation_rate": mutation_rate,
-            "elite_fraction": elite_fraction
+            "elite_fraction": elite_fraction,
+            "nfe": nfe_count
         }
         
         return best_sample, best_score, history, metadata 
