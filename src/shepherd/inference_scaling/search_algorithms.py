@@ -54,7 +54,7 @@ class RandomSearch(SearchAlgorithm):
         """
         super().__init__(verifier, model_runner, name)
         
-    def search(self, num_trials=50, verbose=True, device="cpu"):
+    def search(self, num_trials=50, verbose=True, device="cpu", callback=None):
         """
         Run random search to find the best noise vector.
         
@@ -62,6 +62,8 @@ class RandomSearch(SearchAlgorithm):
             num_trials (int): Number of random noise vectors to try.
             verbose (bool): Whether to print progress information.
             device (str): Device to run the model on ("cpu" or "cuda").
+            callback (callable, optional): Function to call after each trial with signature
+                                        callback(trial, sample, score, best_sample, best_score, scores).
             
         Returns:
             tuple: (best_sample, best_score, scores_history, metadata)
@@ -92,6 +94,10 @@ class RandomSearch(SearchAlgorithm):
                 best_sample = sample
                 if verbose:
                     logging.info(f"Trial {i+1}/{num_trials}: New best score: {best_score:.4f}")
+            
+            # call callback if provided, passing trial context
+            if callback is not None:
+                callback(algorithm='random', iteration=i, sample=sample, score=score)
             
             times.append(time.time() - start_time)
         
@@ -124,7 +130,7 @@ class ZeroOrderSearch(SearchAlgorithm):
         super().__init__(verifier, model_runner, name)
         
     def search(self, num_steps=20, num_neighbors=5, step_size=0.1, 
-               init_noise=None, verbose=True, device="cpu"):
+               init_noise=None, verbose=True, device="cpu", callback=None):
         """
         Run zero-order search to find the best noise vector.
         
@@ -136,6 +142,8 @@ class ZeroOrderSearch(SearchAlgorithm):
                                                 a random noise vector is used.
             verbose (bool): Whether to print progress information.
             device (str): Device to run the model on ("cpu" or "cuda").
+            callback (callable, optional): Function to call after each step with signature
+                                        callback(step, pivot_sample, pivot_score, best_sample, best_score, scores).
             
         Returns:
             tuple: (best_sample, best_score, scores_history, metadata)
@@ -152,6 +160,10 @@ class ZeroOrderSearch(SearchAlgorithm):
             pivot_sample = self.model_runner(noise=pivot_noise)
             pivot_score = self.verifier(pivot_sample)
         
+        # track best sample and score across all iterations
+        best_sample = pivot_sample
+        best_score = pivot_score
+        
         scores = [pivot_score]
         times = []
         
@@ -166,6 +178,7 @@ class ZeroOrderSearch(SearchAlgorithm):
             # generate neighbors
             neighbor_samples = []
             neighbor_scores = []
+            neighbor_noises = []
             
             for n in range(num_neighbors):
                 # add random perturbation to the pivot noise
@@ -180,6 +193,17 @@ class ZeroOrderSearch(SearchAlgorithm):
                 
                 neighbor_samples.append(neighbor_sample)
                 neighbor_scores.append(neighbor_score)
+                neighbor_noises.append(neighbor_noise) # Use the input noise
+                
+                # call callback for this specific neighbor evaluation
+                if callback is not None:
+                    callback(algorithm='zero_order', iteration=step, sub_iteration=n, 
+                             sample=neighbor_sample, score=neighbor_score)
+                
+                # update best overall if this neighbor is better
+                if neighbor_score > best_score:
+                    best_score = neighbor_score
+                    best_sample = neighbor_sample
             
             # find the best neighbor
             best_idx = np.argmax(neighbor_scores)
@@ -189,13 +213,16 @@ class ZeroOrderSearch(SearchAlgorithm):
             if best_neighbor_score > pivot_score:
                 pivot_sample = neighbor_samples[best_idx]
                 pivot_score = best_neighbor_score
-                pivot_noise = self.model_runner.get_last_noise()
+                pivot_noise = neighbor_noises[best_idx]
                 
                 if verbose:
-                    logging.info(f"Step {step+1}/{num_steps}: New best score: {pivot_score:.4f}")
+                    logging.info(f"Step {step+1}/{num_steps}: New pivot score: {pivot_score:.4f}")
             
             scores.append(pivot_score)
             times.append(time.time() - start_time)
+            
+            # if callback is not None:
+            #     callback(step, pivot_sample, pivot_score, best_sample, best_score, scores)
         
         metadata = {
             "mean_time_per_step": np.mean(times),
@@ -205,7 +232,7 @@ class ZeroOrderSearch(SearchAlgorithm):
             "step_size": step_size
         }
         
-        return pivot_sample, pivot_score, scores, metadata
+        return best_sample, best_score, scores, metadata
 
 
 class GuidedSearch(SearchAlgorithm):
@@ -228,7 +255,7 @@ class GuidedSearch(SearchAlgorithm):
         super().__init__(verifier, model_runner, name)
         
     def search(self, pop_size=10, num_generations=5, mutation_rate=0.2, 
-               elite_fraction=0.2, verbose=True, device="cpu"):
+               elite_fraction=0.2, verbose=True, device="cpu", callback=None):
         """
         Run guided search to find the best noise vector.
         
@@ -239,6 +266,8 @@ class GuidedSearch(SearchAlgorithm):
             elite_fraction (float): Fraction of the population to keep as elite.
             verbose (bool): Whether to print progress information.
             device (str): Device to run the model on ("cpu" or "cuda").
+            callback (callable, optional): Function to call after each generation with signature
+                                        callback(gen, population, best_sample, best_score, history).
             
         Returns:
             tuple: (best_sample, best_score, scores_history, metadata)
@@ -267,6 +296,12 @@ class GuidedSearch(SearchAlgorithm):
         
         elite_count = max(1, int(pop_size * elite_fraction))
         
+        # store initial population via callback
+        if callback is not None:
+            for idx, (sample, noise, score) in enumerate(population):
+                callback(algorithm='guided', iteration=0, sub_iteration=idx,
+                         sample=sample, score=score, is_initial=True)
+
         if verbose:
             iterator = tqdm(range(num_generations), desc="Guided Search")
         else:
@@ -300,9 +335,14 @@ class GuidedSearch(SearchAlgorithm):
                 # generate sample with the new noise
                 new_sample = self.model_runner(noise=new_noise)
                 new_score = self.verifier(new_sample)
-                new_noise = self.model_runner.get_last_noise()
+                new_noise_saved = self.model_runner.get_last_noise() # Save the actual noise used
                 
-                new_population.append((new_sample, new_noise, new_score))
+                new_population.append((new_sample, new_noise_saved, new_score))
+
+                # call callback for this specific new individual
+                if callback is not None:
+                    callback(algorithm='guided', iteration=gen + 1, sub_iteration=len(new_population) - 1,
+                             sample=new_sample, score=new_score, is_elite=False)
             
             # update population
             population = new_population
@@ -318,6 +358,9 @@ class GuidedSearch(SearchAlgorithm):
             
             history.append(best_score)
             times.append(time.time() - start_time)
+            
+            # if callback is not None:
+            #     callback(gen, population, best_sample, best_score, history)
         
         metadata = {
             "mean_time_per_generation": np.mean(times),
