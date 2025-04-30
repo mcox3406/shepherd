@@ -20,6 +20,9 @@ class ShepherdModelRunner:
                  unconditional=True,
                  device="cpu",
                  save_all_noise=False,
+                 sampler_type='ddpm',
+                 num_steps=None,
+                 ddim_eta=0.0,
                  **inference_kwargs):
         """
         Initialize the ShepherdModelRunner.
@@ -43,6 +46,11 @@ class ShepherdModelRunner:
         self.inference_kwargs = inference_kwargs
         self.save_all_noise = save_all_noise
         
+        # store sampler parameters
+        self.sampler_type = sampler_type
+        self.num_steps = num_steps
+        self.ddim_eta = ddim_eta
+        
         # store the last noise used for inference
         self.last_noise = None
         self.all_noise = [] if save_all_noise else None
@@ -55,6 +63,9 @@ class ShepherdModelRunner:
             N_x1=self.N_x1,
             N_x4=self.N_x4,
             unconditional=self.unconditional,
+            sampler_type=self.sampler_type,
+            num_steps=self.num_steps,
+            ddim_eta=self.ddim_eta,
             **self.inference_kwargs
         )
     

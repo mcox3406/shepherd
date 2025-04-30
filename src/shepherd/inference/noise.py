@@ -75,6 +75,29 @@ def forward_trajectory(x, ts, alpha_ts, sigma_ts, remove_COM_from_noise = False,
 def _get_noise_params_for_timestep(params, t):
     noise_params = {}
     modalities = ['x1', 'x2', 'x3', 'x4']
+    # assuming all schedules have the same time range and minimum value
+    min_schedule_t = params['noise_schedules']['x1']['ts'].min() 
+
+    # handle t < min_schedule_t (usually t=0) explicitly
+    if t < min_schedule_t:
+        for mod in modalities:
+            # return params corresponding to alpha_dash=1.0, sigma_dash=0.0
+            noise_params[mod] = {
+                't_idx': -1,
+                'alpha_t': 1.0,
+                'sigma_t': 0.0,
+                'alpha_dash_t': 1.0,
+                'var_dash_t': 0.0,
+                'sigma_dash_t': 0.0,
+                't_1': 0,
+                't_1_idx': -1,
+                'alpha_t_1': 1.0, 
+                'sigma_t_1': 0.0,
+                'alpha_dash_t_1': 1.0,
+                'var_dash_t_1': 0.0,
+                'sigma_dash_t_1': 0.0,
+            }
+        return noise_params
 
     for mod in modalities:
         schedule = params['noise_schedules'][mod]
@@ -82,14 +105,16 @@ def _get_noise_params_for_timestep(params, t):
         t_idx = np.where(ts_array == t)[0]
         
         if len(t_idx) == 0:
-            # handle edge case if t is not in the schedule (e.g., after harmonization jump)
+            # if t is not exactly in schedule (e.g., after harmonization)
             # find the closest timestep in the schedule <= t
             valid_indices = np.where(ts_array <= t)[0]
+            # we already know t >= min_schedule_t, so valid_indices should not be empty
             if len(valid_indices) == 0:
-                raise ValueError(f"Timestep {t} is smaller than the smallest timestep in the schedule for {mod}")
-            t_idx = valid_indices[-1]
+                 # this should ideally not happen now
+                 raise RuntimeError(f"Logic error: t={t} >= min_schedule_t={min_schedule_t} but no valid index found in schedule for {mod}.")
+            t_idx = valid_indices[-1] # use the largest index whose time is <= t
         else:
-            t_idx = t_idx[0]
+            t_idx = t_idx[0] # exact match found
 
         mod_params = {
             't_idx': t_idx,
@@ -103,7 +128,7 @@ def _get_noise_params_for_timestep(params, t):
         if t_idx > 0:
             t_1_idx = t_idx - 1
             mod_params.update({
-                't_1': int(ts_array[t_1_idx]), # Store the actual t-1 value
+                't_1': int(ts_array[t_1_idx]), # store the actual t-1 value
                 't_1_idx': t_1_idx,
                 'alpha_t_1': schedule['alpha_ts'][t_1_idx],
                 'sigma_t_1': schedule['sigma_ts'][t_1_idx],
@@ -114,8 +139,8 @@ def _get_noise_params_for_timestep(params, t):
         else:
              mod_params.update({
                 't_1': 0,
-                't_1_idx': -1, # Indicate no t-1 index
-                'alpha_t_1': 1.0, # Defaults for t=0
+                't_1_idx': -1, # indicate no t-1 index
+                'alpha_t_1': 1.0, # defaults for t=0
                 'sigma_t_1': 0.0,
                 'alpha_dash_t_1': 1.0,
                 'var_dash_t_1': 0.0,

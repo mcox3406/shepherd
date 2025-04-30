@@ -65,6 +65,10 @@ def inference_sample(
     harmonize_ts = [],
     harmonize_jumps = [],
     
+    # Sampler controls
+    sampler_type='ddpm', # 'ddpm' or 'ddim'
+    ddim_eta=0.0,      # Controls stochasticity for DDIM (0=deterministic)
+    num_steps=None,     # Number of diffusion steps (defaults to T for DDPM)
     
     # all the below options are only relevant if unconditional is False
     
@@ -184,6 +188,23 @@ def inference_sample(
     params = model_pl.params
     
     T = params['noise_schedules']['x1']['ts'].max()
+    if num_steps is None:
+        num_steps = T
+    if sampler_type == 'ddpm' and num_steps != T:
+        print("Warning: num_steps is ignored for DDPM sampler. Using full T steps.")
+        num_steps = T
+
+    # Determine timestep sequence
+    if num_steps >= T:
+        time_steps = np.arange(T, 0, -1) # Full sequence [T, T-1, ..., 1]
+    else:
+        # Linear spacing for DDIM/Accelerated sampling
+        # Ensure T is the first step and 0 is the last step to calculate x_0
+        time_steps = np.linspace(T, 0, num_steps + 1).round().astype(int)
+        time_steps = np.unique(time_steps)[::-1] # Descending order, unique
+        if time_steps[0] != T: time_steps = np.insert(time_steps, 0, T)
+        if time_steps[-1] != 0: time_steps = np.append(time_steps, 0)
+        print(f"Using {sampler_type.upper()} sampling with {len(time_steps)-1} steps: {time_steps[:5]}...{time_steps[-5:]}")
 
     N_x2 = params['dataset']['x2']['num_points']
     N_x3 = params['dataset']['x3']['num_points']
@@ -438,7 +459,7 @@ def inference_sample(
     
     ######## Main Denoising Loop #########
     
-    pbar = tqdm(total= T + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
+    pbar = tqdm(total=len(time_steps) -1 + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
     
     x1_t_x_list = []
     x1_t_bond_edge_x_list = []
@@ -453,51 +474,75 @@ def inference_sample(
     x4_t_direction_list = []
     x4_t_x_list = []
     
-    while t > 0:
+    current_time_idx = 0
+    while current_time_idx < len(time_steps) - 1:
+        current_t = time_steps[current_time_idx]
+        prev_t = time_steps[current_time_idx + 1] # The time we are calculating state FOR
         
-        # inputs
+        # t passed to helpers/model should be current time
+        t = current_t 
+
+        # inputs (these might be redundant now, t is the main driver)
         x1_t = t
         x2_t = t
         x3_t = t
         x4_t = t
         
         # harmonize
+        # harmonization needs careful consideration with subsequenced timesteps
+        # for now, we only harmonize if t is exactly in harmonize_ts
+        # a jump might skip over a harmonize_ts value in DDIM
+        # if harmonization is used with DDIM, ensure harmonize_ts align with time_steps
+        perform_harmonization_jump = False
+        harmonize_jump_len = 0
         if (harmonize) and (len(harmonize_ts) > 0) and (t == harmonize_ts[0]):
             print(f'Harmonizing... at time {t}')
             harmonize_ts.pop(0)
             if len(harmonize_ts) == 0:
-                harmonize = False
-            harmonize_jump = harmonize_jumps.pop(0)
+                harmonize = False # use up harmonization steps
+            harmonize_jump_len = harmonize_jumps.pop(0)
+            perform_harmonization_jump = True
             
+        if perform_harmonization_jump:
             x1_sigma_ts = params['noise_schedules']['x1']['sigma_ts']
             x2_sigma_ts = params['noise_schedules']['x2']['sigma_ts']
             x3_sigma_ts = params['noise_schedules']['x3']['sigma_ts']
             x4_sigma_ts = params['noise_schedules']['x4']['sigma_ts']
             
-            x1_pos_t, x1_t_jump = forward_jump(x1_pos_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = True, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_x_t, x1_t_jump = forward_jump(x1_x_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = False, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_bond_edge_x_t, x1_t_jump = forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = False, batch = None, mask = None)
+            x1_pos_t, x1_t_jump = forward_jump(x1_pos_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = True, batch = x1_batch, mask = ~virtual_node_mask_x1)
+            x1_x_t, x1_t_jump = forward_jump(x1_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = x1_batch, mask = ~virtual_node_mask_x1)
+            x1_bond_edge_x_t, x1_t_jump = forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = None, mask = None)
             
-            x2_pos_t, x2_t_jump = forward_jump(x2_pos_t, x2_t, harmonize_jump, x2_sigma_ts, remove_COM_from_noise = False, batch = x2_batch, mask = ~virtual_node_mask_x2)
+            x2_pos_t, x2_t_jump = forward_jump(x2_pos_t, x2_t, harmonize_jump_len, x2_sigma_ts, remove_COM_from_noise = False, batch = x2_batch, mask = ~virtual_node_mask_x2)
             
-            x3_pos_t, x3_t_jump = forward_jump(x3_pos_t, x3_t, harmonize_jump, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
-            x3_x_t, x3_t_jump = forward_jump(x3_x_t, x3_t, harmonize_jump, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
+            x3_pos_t, x3_t_jump = forward_jump(x3_pos_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
+            x3_x_t, x3_t_jump = forward_jump(x3_x_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
             
-            x4_pos_t, x4_t_jump = forward_jump(x4_pos_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-            x4_direction_t, x4_t_jump = forward_jump(x4_direction_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-            x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+            x4_pos_t, x4_t_jump = forward_jump(x4_pos_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+            x4_direction_t, x4_t_jump = forward_jump(x4_direction_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+            x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
     
-            
-            x1_t = x1_t_jump
-            x2_t = x2_t_jump
-            x3_t = x3_t_jump
-            x4_t = x4_t_jump
-            
-            assert x1_t == x2_t
-            assert x1_t == x3_t
-            assert x1_t == x4_t
-            t = x1_t
-        
+            # after jumping forward, we need to find the corresponding index in our time_steps
+            # this simple implementation assumes the jump lands exactly on a future step in the sequence
+            # more robust: find the closest step in the sequence
+            jumped_to_t = x1_t_jump # assuming all jumps are same length
+            try:
+                # find where the jumped-to time occurs in the sequence
+                jump_to_idx = np.where(time_steps == jumped_to_t)[0][0]
+                # reset the loop index to continue from the jumped-to time
+                current_time_idx = jump_to_idx
+                pbar.update(harmonize_jump_len) # update progress bar for the jumped steps
+                print(f"Harmonization jumped from t={t} to t={jumped_to_t}, resuming loop.")
+                t = jumped_to_t # update t for the next iteration start
+                # need to re-fetch noise params for the new 't' before proceeding if the loop continued immediately,
+                # but we will recalculate at the start of the next iteration anyway
+                continue # skip the rest of the current loop iteration (denoising step)
+            except IndexError:
+                 print(f"Warning: Harmonization jumped from t={t} to t={jumped_to_t}, which is not in the planned time_steps sequence {time_steps}. Stopping Harmonization.")
+                 harmonize = False # disable future harmonization if jump is incompatible
+                 # continue the loop from the *next* scheduled step after the original t
+
+        # inpainting logic
         if (x2_t > stop_inpainting_at_time_x2) and inpaint_x2_pos:
             x2_pos_t = torch.cat([x2_pos_inpainting_trajectory[x2_t] for _ in range(batch_size)], dim = 0)        
             noise = torch.randn_like(x2_pos_t)
@@ -565,50 +610,23 @@ def inference_sample(
                     x4_x_t = x4_x_t_inpaint
         
         
-        # get noise parameters for current timestep
-        noise_params = _get_noise_params_for_timestep(params, t)
-
-        x1_params = noise_params['x1']
-        x2_params = noise_params['x2']
-        x3_params = noise_params['x3']
-        x4_params = noise_params['x4']
-
-        x1_t_idx = x1_params['t_idx']
-        x1_alpha_t = x1_params['alpha_t']
-        x1_sigma_t = x1_params['sigma_t']
-        x1_var_dash_t = x1_params['var_dash_t']
-        x1_sigma_dash_t = x1_params['sigma_dash_t']
-        x1_sigma_dash_t_1 = x1_params['sigma_dash_t_1']
+        # get noise parameters for current timestep t and previous timestep prev_t
+        noise_params_current = _get_noise_params_for_timestep(params, current_t)
+        noise_params_prev = _get_noise_params_for_timestep(params, prev_t) # Need params for interval end
         
-        x2_t_idx = x2_params['t_idx']
-        x2_alpha_t = x2_params['alpha_t']
-        x2_sigma_t = x2_params['sigma_t']
-        x2_var_dash_t = x2_params['var_dash_t']
-        x2_sigma_dash_t = x2_params['sigma_dash_t']
-        x2_sigma_dash_t_1 = x2_params['sigma_dash_t_1']
-
-        x3_t_idx = x3_params['t_idx']
-        x3_alpha_t = x3_params['alpha_t']
-        x3_sigma_t = x3_params['sigma_t']
-        x3_var_dash_t = x3_params['var_dash_t']
-        x3_sigma_dash_t = x3_params['sigma_dash_t']
-        x3_sigma_dash_t_1 = x3_params['sigma_dash_t_1']
-
-        x4_t_idx = x4_params['t_idx']
-        x4_alpha_t = x4_params['alpha_t']
-        x4_sigma_t = x4_params['sigma_t']
-        x4_var_dash_t = x4_params['var_dash_t']
-        x4_sigma_dash_t = x4_params['sigma_dash_t']
-        x4_sigma_dash_t_1 = x4_params['sigma_dash_t_1']
-        
+        # pass only current params to model input preparation
+        x1_params_current = noise_params_current['x1']
+        x2_params_current = noise_params_current['x2']
+        x3_params_current = noise_params_current['x3']
+        x4_params_current = noise_params_current['x4']
         
         # get current data
         input_dict = _prepare_model_input(
-            model_pl.model.device, torch.float32, batch_size, t,
-            x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params,
-            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params,
-            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params,
-            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params
+            model_pl.model.device, torch.float32, batch_size, current_t,
+            x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params_current,
+            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params_current,
+            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params_current,
+            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params_current
         )
         
 
@@ -670,11 +688,24 @@ def inference_sample(
         
         # Perform reverse denoising step using helper function
         next_state = _perform_reverse_denoising_step(
-            t, batch_size, noise_params,
-            x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, x1_pos_out, x1_x_out, x1_bond_edge_x_out,
-            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_pos_out,
-            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_pos_out, x3_x_out,
-            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_pos_out, x4_direction_out, x4_x_out,
+            current_t, # Pass current time t (tau_i)
+            prev_t,    # Pass previous time t-1 (tau_{i-1})
+            batch_size, 
+            noise_params_current, # Pass params for current time t
+            noise_params_prev,   # Pass params for previous time t-1
+            sampler_type,        # Pass sampler type
+            ddim_eta,            # Pass eta
+            # Current states (x_t)
+            x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, 
+            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, 
+            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, 
+            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, 
+            # Model outputs (predicted noise or x0)
+            x1_pos_out, x1_x_out, x1_bond_edge_x_out,
+            x2_pos_out, 
+            x3_pos_out, x3_x_out,
+            x4_pos_out, x4_direction_out, x4_x_out,
+            # DDPM specific params (used conditionally within the step func)
             denoising_noise_scale, inject_noise_at_ts, inject_noise_scales
         )
 
@@ -721,11 +752,7 @@ def inference_sample(
         x4_direction_t = x4_direction_t_1
         x4_x_t = x4_x_t_1
         
-        t = t - 1
-        x1_t = x1_t - 1
-        x2_t = x2_t - 1
-        x3_t = x3_t - 1
-        x4_t = x4_t - 1
+        current_time_idx += 1 # Move to next index in time_steps sequence
     
         pbar.update(1)
         

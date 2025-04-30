@@ -93,6 +93,14 @@ def parse_args():
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed progress information')
     
+    # sampler configuration
+    parser.add_argument('--sampler_type', type=str, default='ddpm', choices=['ddpm', 'ddim'],
+                        help='Sampling algorithm (ddpm or ddim)')
+    parser.add_argument('--num_sampling_steps', type=int, default=None,
+                        help='Number of steps for the sampler (defaults to T for DDPM, T for DDIM if None)')
+    parser.add_argument('--ddim_eta', type=float, default=0.0,
+                        help='Eta parameter for DDIM sampling (0.0 for deterministic)')
+    
     return parser.parse_args()
 
 
@@ -117,14 +125,25 @@ def generate_experiment_name(args):
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    if args.algorithm == 'random':
-        return f"{args.algorithm}_trials{args.num_trials}_{timestamp}"
-    elif args.algorithm == 'zero_order':
-        return f"{args.algorithm}_steps{args.num_steps}_nbrs{args.num_neighbors}_ss{args.step_size}_{timestamp}"
-    elif args.algorithm == 'guided':
-        return f"{args.algorithm}_pop{args.pop_size}_gen{args.num_generations}_mut{args.mutation_rate}_elite{args.elite_fraction}_{timestamp}"
+    name_parts = []
     
-    return f"{args.algorithm}_{timestamp}"
+    if args.algorithm == 'random':
+        name_parts.append(f"{args.algorithm}_trials{args.num_trials}")
+    elif args.algorithm == 'zero_order':
+        name_parts.append(f"{args.algorithm}_steps{args.num_steps}_nbrs{args.num_neighbors}_ss{args.step_size}")
+    elif args.algorithm == 'guided':
+        name_parts.append(f"{args.algorithm}_pop{args.pop_size}_gen{args.num_generations}_mut{args.mutation_rate}_elite{args.elite_fraction}")
+    
+    # add sampler info if not default DDPM
+    if args.sampler_type != 'ddpm':
+        name_parts.append(f"sampler_{args.sampler_type}")
+        if args.num_sampling_steps is not None:
+            name_parts.append(f"steps{args.num_sampling_steps}")
+        if args.sampler_type == 'ddim':
+             name_parts.append(f"eta{args.ddim_eta}")
+
+    name_parts.append(timestamp)
+    return "_".join(name_parts)
 
 
 def save_results(results, output_path):
@@ -246,6 +265,9 @@ def run_experiment(args):
             harmonize=harmonize,
             harmonize_ts=harmonize_ts,
             harmonize_jumps=harmonize_jumps,
+            sampler_type=args.sampler_type,
+            num_steps=args.num_sampling_steps,
+            ddim_eta=args.ddim_eta
         )
         
         print("Creating verifiers")
