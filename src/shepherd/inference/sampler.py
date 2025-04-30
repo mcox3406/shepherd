@@ -1,110 +1,49 @@
-import open3d 
+import open3d
+import rdkit
+from rdkit.Chem import rdDetermineBonds
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch_geometric
+import torch_scatter
+import pickle
+from copy import deepcopy
+import os
+from tqdm import tqdm
+import sys
+
+sys.path.insert(-1, "../model/")
+sys.path.insert(-1, "../model/equiformer_v2")
+
+import pytorch_lightning as pl
+from shepherd.lightning_module import LightningModule
+from shepherd.datasets import HeteroDataset
+
+from .initialization import (
+    _initialize_x1_state,
+    _initialize_x2_state,
+    _initialize_x3_state,
+    _initialize_x4_state
+)
+from .noise import (
+    forward_trajectory,
+    _get_noise_params_for_timestep,
+    forward_jump
+)
+from .steps import (
+    _perform_reverse_denoising_step,
+    _prepare_model_input
+)
+
 from shepherd.shepherd_score_utils.generate_point_cloud import (
-    get_atom_coords, 
-    get_atomic_vdw_radii, 
+    get_atom_coords,
+    get_atomic_vdw_radii,
     get_molecular_surface,
     get_electrostatics,
     get_electrostatics_given_point_charges,
 )
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 from shepherd.shepherd_score_utils.conformer_generation import update_mol_coordinates
-
-import rdkit
-from rdkit.Chem import rdDetermineBonds
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-import torch
-import torch_geometric
-from torch_geometric.nn import radius_graph
-import torch_scatter
-
-import pickle
-from copy import deepcopy
-import os
-import multiprocessing
-from tqdm import tqdm
-
-import sys
-sys.path.insert(-1, "model/")
-sys.path.insert(-1, "model/equiformer_v2")
-
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-
-from shepherd.lightning_module import LightningModule
-from shepherd.datasets import HeteroDataset
-
-import importlib
-
-# harmonization functions
-def forward_jump_parameters(t_start_idx, jump, sigma_ts):
-    t_end_idx = t_start_idx + jump
-    sigma_ts_ = sigma_ts[t_start_idx : t_end_idx] # std deviation schedule
-    alpha_ts_ = (1. - sigma_ts_** 2.0)**0.5 # how much (mean) signal is preserved at each noising step
-    alpha_dash_ts_ = np.cumprod(alpha_ts_)
-    var_dash_ts_ = 1. - alpha_dash_ts_**2.0
-    sigma_dash_ts_ = var_dash_ts_**0.5
-    return alpha_dash_ts_[-1], sigma_dash_ts_[-1], t_end_idx
-
-def forward_jump(x, t_start, jump, sigma_ts, remove_COM_from_noise = False, batch = None, mask = None):
-    assert t_start + jump <= sigma_ts.shape[0] + 1 # can't jump past t=T
-    
-    if mask is None:
-        mask = torch.zeros(x.shape, dtype = torch.long) == 0
-    
-    t_start_idx = t_start - 1
-    alpha_jump, sigma_jump, t_end_idx = forward_jump_parameters(t_start_idx, jump, sigma_ts)
-    t_end = t_end_idx + 1
-    
-    noise = torch.randn(x.shape)
-    if remove_COM_from_noise:
-        assert batch is not None
-        assert len(x.shape) == 2
-        # noise must have shape (N, 3)
-        assert noise.shape[1] == 3
-        noise = noise - torch_scatter.scatter_mean(noise[mask], batch[mask], dim = 0)[batch]
-    noise[~mask, ...] = 0.0
-    
-    x_jump = alpha_jump * x + sigma_jump * noise
-    x_jump[~mask] = x[~mask]
-    
-    return x_jump, t_end
-
-# simulate forward noising trajectory
-def forward_trajectory(x, ts, alpha_ts, sigma_ts, remove_COM_from_noise = False, mask = None, deterministic = False):
-    if mask is None:
-        mask = torch.ones(x.shape[0]) == 1.0
-    
-    if remove_COM_from_noise:
-        assert x.shape[1] == 3
-    
-    trajectory = {0:x}
-    
-    x_t = x
-    for t_idx, t in enumerate(ts):
-        
-        alpha_t = alpha_ts[t_idx]
-        sigma_t = sigma_ts[t_idx]
-        
-        noise = torch.randn(x.shape)
-        if remove_COM_from_noise:
-            noise = noise - torch.mean(noise[mask], dim = 0)
-        noise[~mask, ...] = 0.0
-        
-        if deterministic:
-            noise = 0.0
-        
-        x_t_plus_1 = alpha_t * x_t + sigma_t * noise
-        x_t_plus_1[~mask, ...] = x_t[~mask, ...]
-        
-        trajectory[t] = x_t_plus_1
-        
-        x_t = x_t_plus_1
-    
-    return trajectory
 
 
 def inference_sample(
@@ -390,182 +329,32 @@ def inference_sample(
     ###########  Initializing states at t=T   ##############
     
     include_virtual_node = True
-
     num_atom_types = len(params['dataset']['x1']['atom_types']) + len(params['dataset']['x1']['charge_types'])
-    num_pharm_types = params['dataset']['x4']['max_node_types']
+    num_pharm_types = params['dataset']['x4']['max_node_types'] # needed later for inpainting
+
+    # Initialize x1 state
+    (pos_forward_noised_x1, x_forward_noised_x1, bond_edge_x_forward_noised_x1, 
+     x1_batch, virtual_node_mask_x1, bond_edge_index_x1) = _initialize_x1_state(
+         batch_size, N_x1, params, prior_noise_scale, include_virtual_node
+     )
     
-    bond_adj = np.triu(1-np.diag(np.ones(N_x1, dtype = int))) # directed graph, to only include 1 edge per bond
-    bond_edge_index = np.stack(bond_adj.nonzero(), axis = 0) # this doesn't include any edges to the virtual node
-    bond_edge_index = bond_edge_index + int(include_virtual_node)
-    bond_edge_index = torch.as_tensor(bond_edge_index, dtype = torch.long)
-    
-    x1_batch = torch.cat([
-        torch.ones(N_x1 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
-    ])
-    virtual_node_pos_x1 = torch.tensor([[0.,0.,0.]], dtype = torch.float)
-    virtual_node_x_x1 = torch.zeros(num_atom_types, dtype = torch.float)
-    virtual_node_x_x1[0] = 1. * params['dataset']['x1']['scale_atom_features'] # one-hot encoding, that remains unnoised
-    virtual_node_x_x1 = virtual_node_x_x1[None, ...]
-    
-    
-    x2_batch = torch.cat([
-        torch.ones(N_x2 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
-    ])
-    virtual_node_pos_x2 = torch.tensor([[0.,0.,0.]], dtype = torch.float) # same as virtual node for x1
-    
-    
-    x3_batch = torch.cat([
-        torch.ones(N_x3 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
-    ])
-    virtual_node_pos_x3 = torch.tensor([[0.,0.,0.]], dtype = torch.float) # same as virtual node for x1
-    virtual_node_x_x3 = torch.tensor([0.0], dtype = torch.float)
-    
-    
-    x4_batch = torch.cat([
-        torch.ones(N_x4 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
-    ])
-    virtual_node_direction_x4 = torch.tensor([[0.,0.,0.]], dtype = torch.float) 
-    virtual_node_pos_x4 = torch.tensor([[0.,0.,0.]], dtype = torch.float) # same as virtual node for x1
-    virtual_node_x_x4 =  torch.zeros(num_pharm_types, dtype = torch.float)
-    virtual_node_x_x4[0] = 1. * params['dataset']['x4']['scale_node_features'] # one-hot encoding, that remains unnoised
-    virtual_node_x_x4 = virtual_node_x_x4[None, ...]
-    
-    
-    # initial state
-    virtual_node_mask_x1 = []
-    pos_forward_noised_x1 = []
-    x_forward_noised_x1 = []
-    bond_edge_x_forward_noised_x1 = [] 
-    bond_edge_index_x1 = []
-    num_nodes_counter = 0
-    for b in range(batch_size):
-        # continuous gaussian noise for coordinates
-        x1_pos_T = torch.randn(N_x1, 3) * prior_noise_scale # t = T
-        x1_pos_T = x1_pos_T - torch.mean(x1_pos_T, dim = 0) # removing COM from starting structure
-        
-        # continuous gaussian noise for atom features
-        x1_x_T = torch.randn(N_x1, num_atom_types)
-        
-        # continuous gaussian noise for bond features
-        x1_bond_edge_x_T = torch.randn(bond_edge_index.shape[1], len(params['dataset']['x1']['bond_types']))
-        
-        x1_virtual_node_mask_ = torch.zeros(N_x1 + int(include_virtual_node), dtype = torch.long)
-        if include_virtual_node:
-            x1_virtual_node_mask_[0] = 1
-            x1_virtual_node_mask_ = x1_virtual_node_mask_ == 1
-    
-            x1_pos_T = torch.cat([virtual_node_pos_x1, x1_pos_T], dim = 0)
-            x1_x_T = torch.cat([virtual_node_x_x1, x1_x_T], dim = 0)
-        
-        pos_forward_noised_x1.append(x1_pos_T)
-        x_forward_noised_x1.append(x1_x_T)
-        virtual_node_mask_x1.append(x1_virtual_node_mask_)
-        
-        bond_edge_x_forward_noised_x1.append(x1_bond_edge_x_T)
-        bond_edge_index_x1.append(bond_edge_index + num_nodes_counter)
-        num_nodes_counter += N_x1 + int(include_virtual_node)
-        
-    pos_forward_noised_x1 = torch.cat(pos_forward_noised_x1, dim = 0)
-    x_forward_noised_x1 = torch.cat(x_forward_noised_x1, dim = 0)
-    virtual_node_mask_x1 = torch.cat(virtual_node_mask_x1, dim =0)
-    bond_edge_x_forward_noised_x1 = torch.cat(bond_edge_x_forward_noised_x1, dim =0)
-    bond_edge_index_x1 = torch.cat(bond_edge_index_x1, dim =1)
-    
-    
-    virtual_node_mask_x2 = []
-    pos_forward_noised_x2 = []
-    x_forward_noised_x2 = [] # this is an unnoised one-hot embedding of real/virtual node
-    for b in range(batch_size):
-        
-        # this remains unnoised
-        x2_x_T = torch.zeros((N_x2 + int(include_virtual_node), 2))
-        x2_x_T[:,0] = 1
-        if include_virtual_node:
-            x2_x_T[0,0] = 0
-            x2_x_T[0,1] = 1
-        
-        
-        x2_pos_T = torch.randn(N_x2, 3) * prior_noise_scale # t = T 
-        # NOT removing COM
-    
-        x2_virtual_node_mask_ = torch.zeros(N_x2 + int(include_virtual_node), dtype = torch.long)
-        if include_virtual_node:
-            x2_virtual_node_mask_[0] = 1
-            x2_virtual_node_mask_ = x2_virtual_node_mask_ == 1
-    
-            x2_pos_T = torch.cat([virtual_node_pos_x2, x2_pos_T], dim = 0)
-        
-        pos_forward_noised_x2.append(x2_pos_T)
-        x_forward_noised_x2.append(x2_x_T)
-        virtual_node_mask_x2.append(x2_virtual_node_mask_)
-    pos_forward_noised_x2 = torch.cat(pos_forward_noised_x2, dim = 0)
-    x_forward_noised_x2 = torch.cat(x_forward_noised_x2, dim = 0)
-    virtual_node_mask_x2 = torch.cat(virtual_node_mask_x2, dim =0)
-    
-    
-    virtual_node_mask_x3 = []
-    pos_forward_noised_x3 = []
-    x_forward_noised_x3 = []
-    for b in range(batch_size):
-        
-        # continuous gaussian noise for electrostatic potential
-        x3_x_T = torch.randn(N_x3, dtype = torch.float) * prior_noise_scale
-        
-        x3_pos_T = torch.randn(N_x3, 3) * prior_noise_scale # t = T 
-        # NOT removing COM from x2/x3 starting structure
-    
-        x3_virtual_node_mask_ = torch.zeros(N_x3 + int(include_virtual_node), dtype = torch.long)
-        if include_virtual_node:
-            x3_virtual_node_mask_[0] = 1
-            x3_virtual_node_mask_ = x3_virtual_node_mask_ == 1
-    
-            x3_pos_T = torch.cat([virtual_node_pos_x3, x3_pos_T], dim = 0)
-            x3_x_T = torch.cat([virtual_node_x_x3, x3_x_T], dim = 0)
-        
-        pos_forward_noised_x3.append(x3_pos_T)
-        x_forward_noised_x3.append(x3_x_T)
-        virtual_node_mask_x3.append(x3_virtual_node_mask_)
-    pos_forward_noised_x3 = torch.cat(pos_forward_noised_x3, dim = 0)
-    x_forward_noised_x3 = torch.cat(x_forward_noised_x3, dim = 0)
-    virtual_node_mask_x3 = torch.cat(virtual_node_mask_x3, dim =0)
-    
-    
-    virtual_node_mask_x4 = []
-    pos_forward_noised_x4 = []
-    direction_forward_noised_x4 = []
-    x_forward_noised_x4 = []
-    for b in range(batch_size):
-        
-        # continuous gaussian noise for coordinates
-        x4_pos_T = torch.randn(N_x4, 3) * prior_noise_scale # t = T
-        # NOT removing COM from x4
-        
-        # continuous gaussian noise for directions
-        x4_direction_T = torch.randn(N_x4, 3) * prior_noise_scale # t = T
-        
-        # continuous gaussian noise for atom features
-        x4_x_T = torch.randn(N_x4, num_pharm_types)
-        
-        x4_virtual_node_mask_ = torch.zeros(N_x4 + int(include_virtual_node), dtype = torch.long)
-        if include_virtual_node:
-            x4_virtual_node_mask_[0] = 1
-            x4_virtual_node_mask_ = x4_virtual_node_mask_ == 1
-    
-            x4_pos_T = torch.cat([virtual_node_pos_x4, x4_pos_T], dim = 0)
-            x4_direction_T = torch.cat([virtual_node_direction_x4, x4_direction_T], dim = 0)
-            x4_x_T = torch.cat([virtual_node_x_x4, x4_x_T], dim = 0)
-        
-        pos_forward_noised_x4.append(x4_pos_T)
-        direction_forward_noised_x4.append(x4_direction_T)
-        x_forward_noised_x4.append(x4_x_T)
-        virtual_node_mask_x4.append(x4_virtual_node_mask_)
-        
-    pos_forward_noised_x4 = torch.cat(pos_forward_noised_x4, dim = 0)
-    direction_forward_noised_x4 = torch.cat(direction_forward_noised_x4, dim = 0)
-    x_forward_noised_x4 = torch.cat(x_forward_noised_x4, dim = 0)
-    virtual_node_mask_x4 = torch.cat(virtual_node_mask_x4, dim =0)
-    
-    
+    # Initialize x2 state
+    pos_forward_noised_x2, x_forward_noised_x2, x2_batch, virtual_node_mask_x2 = _initialize_x2_state(
+        batch_size, N_x2, params, prior_noise_scale, include_virtual_node
+    )
+
+    # Initialize x3 state
+    pos_forward_noised_x3, x_forward_noised_x3, x3_batch, virtual_node_mask_x3 = _initialize_x3_state(
+        batch_size, N_x3, params, prior_noise_scale, include_virtual_node
+    )
+
+    # Initialize x4 state
+    (pos_forward_noised_x4, direction_forward_noised_x4, x_forward_noised_x4, 
+     x4_batch, virtual_node_mask_x4) = _initialize_x4_state(
+         batch_size, N_x4, params, prior_noise_scale, include_virtual_node
+     )
+
+
     # renaming variables for consistency
     x1_pos_t = pos_forward_noised_x1
     x1_x_t = x_forward_noised_x1
@@ -599,14 +388,23 @@ def inference_sample(
     
     if (x2_t > stop_inpainting_at_time_x2):
         if inpaint_x2_pos:
-            x2_pos_t = torch.cat([x2_pos_inpainting_trajectory[x2_t] for _ in range(batch_size)], dim = 0)
-    
+            x2_pos_t = torch.cat([x2_pos_inpainting_trajectory[x2_t] for _ in range(batch_size)], dim = 0)        
+            noise = torch.randn_like(x2_pos_t)
+            noise[virtual_node_mask_x2] = 0.0
+            x2_pos_t = x2_pos_t + add_noise_to_inpainted_x2_pos * noise
+        
     if (x3_t > stop_inpainting_at_time_x3):
         if inpaint_x3_pos:
-            x3_pos_t = torch.cat([x3_pos_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)
+            x3_pos_t = torch.cat([x3_pos_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)        
+            noise = torch.randn_like(x3_pos_t)
+            noise[virtual_node_mask_x3] = 0.0
+            x3_pos_t = x3_pos_t + add_noise_to_inpainted_x3_pos * noise
         if inpaint_x3_x:
             x3_x_t = torch.cat([x3_x_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)
-    
+            noise = torch.randn_like(x3_x_t)
+            noise[virtual_node_mask_x3] = 0.0
+            x3_x_t = x3_x_t + add_noise_to_inpainted_x3_x * noise
+        
     if (x4_t > stop_inpainting_at_time_x4):
         if inpaint_x4_pos:
             # x4_pos_t_inpaint = torch.cat([x4_pos_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
@@ -648,12 +446,12 @@ def inference_sample(
     
     x2_t_pos_list = []
     
-    x3_t_x_list = []
     x3_t_pos_list = []
+    x3_t_x_list = []
     
-    x4_t_x_list = []
     x4_t_pos_list = []
     x4_t_direction_list = []
+    x4_t_x_list = []
     
     while t > 0:
         
@@ -717,7 +515,7 @@ def inference_sample(
                 noise = torch.randn_like(x3_x_t)
                 noise[virtual_node_mask_x3] = 0.0
                 x3_x_t = x3_x_t + add_noise_to_inpainted_x3_x * noise
-            
+        
         if (x4_t > stop_inpainting_at_time_x4):
             if inpaint_x4_pos:
                 x4_pos_t_inpaint = torch.cat([x4_pos_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
@@ -768,175 +566,50 @@ def inference_sample(
         
         
         # get noise parameters for current timestep
-        x1_t_idx = np.where(params['noise_schedules']['x1']['ts'] == x1_t)[0][0]
-        x1_alpha_t = params['noise_schedules']['x1']['alpha_ts'][x1_t_idx]
-        x1_sigma_t = params['noise_schedules']['x1']['sigma_ts'][x1_t_idx]
-        x1_alpha_dash_t = params['noise_schedules']['x1']['alpha_dash_ts'][x1_t_idx]
-        x1_var_dash_t = params['noise_schedules']['x1']['var_dash_ts'][x1_t_idx]
-        x1_sigma_dash_t = params['noise_schedules']['x1']['sigma_dash_ts'][x1_t_idx]
+        noise_params = _get_noise_params_for_timestep(params, t)
+
+        x1_params = noise_params['x1']
+        x2_params = noise_params['x2']
+        x3_params = noise_params['x3']
+        x4_params = noise_params['x4']
+
+        x1_t_idx = x1_params['t_idx']
+        x1_alpha_t = x1_params['alpha_t']
+        x1_sigma_t = x1_params['sigma_t']
+        x1_var_dash_t = x1_params['var_dash_t']
+        x1_sigma_dash_t = x1_params['sigma_dash_t']
+        x1_sigma_dash_t_1 = x1_params['sigma_dash_t_1']
         
-        # get noise parameters for next timestep
-        if x1_t_idx > 0:
-            x1_t_1 = x1_t - 1
-            x1_t_1_idx = x1_t_idx - 1
-            x1_alpha_t_1 = params['noise_schedules']['x1']['alpha_ts'][x1_t_1_idx]
-            x1_sigma_t_1 = params['noise_schedules']['x1']['sigma_ts'][x1_t_1_idx]
-            x1_alpha_dash_t_1 = params['noise_schedules']['x1']['alpha_dash_ts'][x1_t_1_idx]
-            x1_var_dash_t_1 = params['noise_schedules']['x1']['var_dash_ts'][x1_t_1_idx]
-            x1_sigma_dash_t_1 = params['noise_schedules']['x1']['sigma_dash_ts'][x1_t_1_idx]
-            
-        
-        # get noise parameters for current timestep
-        x2_t_idx = np.where(params['noise_schedules']['x2']['ts'] == x2_t)[0][0]
-        x2_alpha_t = params['noise_schedules']['x2']['alpha_ts'][x2_t_idx]
-        x2_sigma_t = params['noise_schedules']['x2']['sigma_ts'][x2_t_idx]
-        x2_alpha_dash_t = params['noise_schedules']['x2']['alpha_dash_ts'][x2_t_idx]
-        x2_var_dash_t = params['noise_schedules']['x2']['var_dash_ts'][x2_t_idx]
-        x2_sigma_dash_t = params['noise_schedules']['x2']['sigma_dash_ts'][x2_t_idx]
-        
-        # get noise parameters for next timestep
-        if x2_t_idx > 0:
-            x2_t_1 = x2_t - 1
-            x2_t_1_idx = x2_t_idx - 1
-            x2_alpha_t_1 = params['noise_schedules']['x2']['alpha_ts'][x2_t_1_idx]
-            x2_sigma_t_1 = params['noise_schedules']['x2']['sigma_ts'][x2_t_1_idx]
-            x2_alpha_dash_t_1 = params['noise_schedules']['x2']['alpha_dash_ts'][x2_t_1_idx]
-            x2_var_dash_t_1 = params['noise_schedules']['x2']['var_dash_ts'][x2_t_1_idx]
-            x2_sigma_dash_t_1 = params['noise_schedules']['x2']['sigma_dash_ts'][x2_t_1_idx]
-        
-        
-        # get noise parameters for current timestep
-        x3_t_idx = np.where(params['noise_schedules']['x3']['ts'] == x3_t)[0][0]
-        x3_alpha_t = params['noise_schedules']['x3']['alpha_ts'][x3_t_idx]
-        x3_sigma_t = params['noise_schedules']['x3']['sigma_ts'][x3_t_idx]
-        x3_alpha_dash_t = params['noise_schedules']['x3']['alpha_dash_ts'][x3_t_idx]
-        x3_var_dash_t = params['noise_schedules']['x3']['var_dash_ts'][x3_t_idx]
-        x3_sigma_dash_t = params['noise_schedules']['x3']['sigma_dash_ts'][x3_t_idx]
-        
-        # get noise parameters for next timestep
-        if x3_t_idx > 0:
-            x3_t_1 = x3_t - 1
-            x3_t_1_idx = x3_t_idx - 1
-            x3_alpha_t_1 = params['noise_schedules']['x3']['alpha_ts'][x3_t_1_idx]
-            x3_sigma_t_1 = params['noise_schedules']['x3']['sigma_ts'][x3_t_1_idx]
-            x3_alpha_dash_t_1 = params['noise_schedules']['x3']['alpha_dash_ts'][x3_t_1_idx]
-            x3_var_dash_t_1 = params['noise_schedules']['x3']['var_dash_ts'][x3_t_1_idx]
-            x3_sigma_dash_t_1 = params['noise_schedules']['x3']['sigma_dash_ts'][x3_t_1_idx]
-        
-        # get noise parameters for current timestep
-        x4_t_idx = np.where(params['noise_schedules']['x4']['ts'] == x4_t)[0][0]
-        x4_alpha_t = params['noise_schedules']['x4']['alpha_ts'][x4_t_idx]
-        x4_sigma_t = params['noise_schedules']['x4']['sigma_ts'][x4_t_idx]
-        x4_alpha_dash_t = params['noise_schedules']['x4']['alpha_dash_ts'][x4_t_idx]
-        x4_var_dash_t = params['noise_schedules']['x4']['var_dash_ts'][x4_t_idx]
-        x4_sigma_dash_t = params['noise_schedules']['x4']['sigma_dash_ts'][x4_t_idx]
-        
-        # get noise parameters for next timestep
-        if x4_t_idx > 0:
-            x4_t_1 = x4_t - 1
-            x4_t_1_idx = x4_t_idx - 1
-            x4_alpha_t_1 = params['noise_schedules']['x4']['alpha_ts'][x4_t_1_idx]
-            x4_sigma_t_1 = params['noise_schedules']['x4']['sigma_ts'][x4_t_1_idx]
-            x4_alpha_dash_t_1 = params['noise_schedules']['x4']['alpha_dash_ts'][x4_t_1_idx]
-            x4_var_dash_t_1 = params['noise_schedules']['x4']['var_dash_ts'][x4_t_1_idx]
-            x4_sigma_dash_t_1 = params['noise_schedules']['x4']['sigma_dash_ts'][x4_t_1_idx]
-        
+        x2_t_idx = x2_params['t_idx']
+        x2_alpha_t = x2_params['alpha_t']
+        x2_sigma_t = x2_params['sigma_t']
+        x2_var_dash_t = x2_params['var_dash_t']
+        x2_sigma_dash_t = x2_params['sigma_dash_t']
+        x2_sigma_dash_t_1 = x2_params['sigma_dash_t_1']
+
+        x3_t_idx = x3_params['t_idx']
+        x3_alpha_t = x3_params['alpha_t']
+        x3_sigma_t = x3_params['sigma_t']
+        x3_var_dash_t = x3_params['var_dash_t']
+        x3_sigma_dash_t = x3_params['sigma_dash_t']
+        x3_sigma_dash_t_1 = x3_params['sigma_dash_t_1']
+
+        x4_t_idx = x4_params['t_idx']
+        x4_alpha_t = x4_params['alpha_t']
+        x4_sigma_t = x4_params['sigma_t']
+        x4_var_dash_t = x4_params['var_dash_t']
+        x4_sigma_dash_t = x4_params['sigma_dash_t']
+        x4_sigma_dash_t_1 = x4_params['sigma_dash_t_1']
         
         
         # get current data
-        x1_timestep = torch.tensor([x1_t] * batch_size)
-        x2_timestep = torch.tensor([x2_t] * batch_size)
-        x3_timestep = torch.tensor([x3_t] * batch_size)
-        x4_timestep = torch.tensor([x4_t] * batch_size)
-        
-        x1_sigma_dash_t_ = torch.tensor([x1_sigma_dash_t] * batch_size, dtype = torch.float)
-        x1_alpha_dash_t_ = torch.tensor([x1_alpha_dash_t] * batch_size, dtype = torch.float)
-        
-        x2_sigma_dash_t_ = torch.tensor([x2_sigma_dash_t] * batch_size, dtype = torch.float)
-        x2_alpha_dash_t_ = torch.tensor([x2_alpha_dash_t] * batch_size, dtype = torch.float)
-        
-        x3_sigma_dash_t_ = torch.tensor([x3_sigma_dash_t] * batch_size, dtype = torch.float)
-        x3_alpha_dash_t_ = torch.tensor([x3_alpha_dash_t] * batch_size, dtype = torch.float)
-        
-        x4_sigma_dash_t_ = torch.tensor([x4_sigma_dash_t] * batch_size, dtype = torch.float)
-        x4_alpha_dash_t_ = torch.tensor([x4_alpha_dash_t] * batch_size, dtype = torch.float)
-        
-        
-        
-        input_dict = {}
-        input_dict['device'] = model_pl.model.device
-        input_dict['dtype'] = torch.float32
-        input_dict['x1'] =  {
-            
-            # the decoder uses the forward-noised structures
-            'decoder': {
-                'pos': x1_pos_t.to(input_dict['device']), # this is the structure after forward-noising
-                'x': x1_x_t.to(input_dict['device']), # this is the structure after forward-noising
-                'batch': x1_batch.to(input_dict['device']),
-                
-                'bond_edge_x': x1_bond_edge_x_t.to(input_dict['device']), # this is the structure after forward-noising
-                'bond_edge_index': bond_edge_index_x1.to(input_dict['device']),
-                
-                'timestep': x1_timestep.to(input_dict['device']),
-                'sigma_dash_t': x1_sigma_dash_t_.to(input_dict['device']),
-                'alpha_dash_t': x1_alpha_dash_t_.to(input_dict['device']),
-    
-                'virtual_node_mask': virtual_node_mask_x1.to(input_dict['device']),
-                
-            },
-        }    
-        
-        input_dict['x2'] =  {
-            
-            # the decoder uses the forward-noised structures
-            'decoder': {
-                'pos': x2_pos_t.to(input_dict['device']), # this is the structure after forward-noising
-                'x': x2_x_t.to(input_dict['device']), # this is the structure after forward-noising
-                'batch': x2_batch.to(input_dict['device']),
-                
-                'timestep': x2_timestep.to(input_dict['device']),
-                'sigma_dash_t': x2_sigma_dash_t_.to(input_dict['device']),
-                'alpha_dash_t': x2_alpha_dash_t_.to(input_dict['device']),
-                
-                'virtual_node_mask': virtual_node_mask_x2.to(input_dict['device']),
-                
-            },
-        }
-        
-        input_dict['x3'] =  {
-            
-            # the decoder uses the forward-noised structures
-            'decoder': {
-                'pos': x3_pos_t.to(input_dict['device']), # this is the structure after forward-noising
-                'x': x3_x_t.to(input_dict['device']), # this is the structure after forward-noising
-                'batch': x3_batch.to(input_dict['device']),
-                
-                'timestep': x3_timestep.to(input_dict['device']),
-                'sigma_dash_t': x3_sigma_dash_t_.to(input_dict['device']),
-                'alpha_dash_t': x3_alpha_dash_t_.to(input_dict['device']),
-                
-                'virtual_node_mask': virtual_node_mask_x3.to(input_dict['device']),
-                
-            },
-        }
-        
-        input_dict['x4'] =  {
-            
-            # the decoder uses the forward-noised structures
-            'decoder': {
-                'x': x4_x_t.to(input_dict['device']), # this is the structure after forward-noising
-                'pos': x4_pos_t.to(input_dict['device']), # this is the structure after forward-noising
-                'direction': x4_direction_t.to(input_dict['device']), # this is the structure after forward-noising
-                'batch': x4_batch.to(input_dict['device']),
-                
-                'timestep': x4_timestep.to(input_dict['device']),
-                'sigma_dash_t': x4_sigma_dash_t_.to(input_dict['device']),
-                'alpha_dash_t': x4_alpha_dash_t_.to(input_dict['device']),
-                
-                'virtual_node_mask': virtual_node_mask_x4.to(input_dict['device']),
-                
-            },
-        }
+        input_dict = _prepare_model_input(
+            model_pl.model.device, torch.float32, batch_size, t,
+            x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params,
+            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params,
+            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params,
+            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params
+        )
         
 
         # predict noise with neural network    
@@ -995,103 +668,27 @@ def inference_sample(
         
         
         
-        # get added noise - x1
-        x1_pos_epsilon = torch.randn(x1_batch_size_nodes, 3)
-        x1_pos_epsilon = x1_pos_epsilon - torch_scatter.scatter_mean(x1_pos_epsilon[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim = 0)[x1_batch] # removing COM from added noise
-        x1_pos_epsilon[virtual_node_mask_x1, :] = 0.0
-        
-        x1_x_epsilon = torch.randn(x1_batch_size_nodes, num_atom_types)    
-        x1_x_epsilon[virtual_node_mask_x1, :] = 0.0
-        
-        x1_bond_edge_x_epsilon = torch.randn_like(x1_bond_edge_x_out)
-        
-        x1_c_t = (x1_sigma_t * x1_sigma_dash_t_1) / (x1_sigma_dash_t) if x1_t_idx > 0 else 0
-        x1_c_t = x1_c_t * denoising_noise_scale
-        
-        
-        # get added noise - x2
-        x2_pos_epsilon = torch.randn(x2_batch_size_nodes,3)
-        x2_pos_epsilon[virtual_node_mask_x2, :] = 0.0
-        
-        x2_c_t = (x2_sigma_t * x2_sigma_dash_t_1) / (x2_sigma_dash_t) if x2_t_idx > 0 else 0
-        x2_c_t = x2_c_t * denoising_noise_scale
-        
-        
-        # get added noise - x3
-        x3_pos_epsilon = torch.randn(x3_batch_size_nodes,3)
-        x3_pos_epsilon[virtual_node_mask_x3, :] = 0.0
-        
-        x3_x_epsilon = torch.randn(x3_batch_size_nodes)    
-        x3_x_epsilon[virtual_node_mask_x3, ...] = 0.0
-       
-        x3_c_t = (x3_sigma_t * x3_sigma_dash_t_1) / (x3_sigma_dash_t) if x3_t_idx > 0 else 0
-        x3_c_t = x3_c_t * denoising_noise_scale
-        
-        
-        # get added noise - x4
-        x4_pos_epsilon = torch.randn(x4_batch_size_nodes,3)
-        x4_pos_epsilon[virtual_node_mask_x4, :] = 0.0
-        
-        x4_direction_epsilon = torch.randn(x4_batch_size_nodes, 3)
-        x4_direction_epsilon[virtual_node_mask_x4, :] = 0.0
-        
-        x4_x_epsilon = torch.randn(x4_batch_size_nodes, num_pharm_types)    
-        x4_x_epsilon[virtual_node_mask_x4, ...] = 0.0
-       
-        x4_c_t = (x4_sigma_t * x4_sigma_dash_t_1) / (x4_sigma_dash_t) if x4_t_idx > 0 else 0
-        x4_c_t = x4_c_t * denoising_noise_scale
-        
-        
-        # (intended for symmetry breaking, but could also be used for increasing diversity of samples)
-        x1_c_t_injected = x1_c_t
-        x2_c_t_injected = x2_c_t
-        x3_c_t_injected = x3_c_t
-        x4_c_t_injected = x4_c_t
-        if len(inject_noise_at_ts) > 0:
-            if t == inject_noise_at_ts[0]:
-                #print(f'injecting noise... at time {t}')
-                inject_noise_at_ts.pop(0)
-                inject_noise_scale = inject_noise_scales.pop(0)
-                
-                # extra noisy, only applied to positions to break symmetry
-                x1_c_t_injected = x1_c_t + inject_noise_scale
-                x2_c_t_injected = x2_c_t + inject_noise_scale
-                x3_c_t_injected = x3_c_t + inject_noise_scale
-                x4_c_t_injected = x4_c_t + inject_noise_scale
-        
-        
-        # reverse denoising step - x1
-        x1_pos_t_1 = ((1. / x1_alpha_t) * x1_pos_t)  - ((x1_var_dash_t/(x1_alpha_t * x1_sigma_dash_t)) * x1_pos_out)  +  (x1_c_t_injected * x1_pos_epsilon)
-        x1_x_t_1 = ((1. / x1_alpha_t) * x1_x_t)  - ((x1_var_dash_t/(x1_alpha_t * x1_sigma_dash_t)) * x1_x_out)  +  (x1_c_t * x1_x_epsilon)
-        x1_bond_edge_x_t_1 = ((1. / x1_alpha_t) * x1_bond_edge_x_t)  - ((x1_var_dash_t/(x1_alpha_t * x1_sigma_dash_t)) * x1_bond_edge_x_out)  +  (x1_c_t * x1_bond_edge_x_epsilon)
-        
-        # reverse denoising step - x2
-        x2_pos_t_1 = ((1. / float(x2_alpha_t)) * x2_pos_t)  - ((x2_var_dash_t/(x2_alpha_t * x2_sigma_dash_t)) * x2_pos_out)  +  (x2_c_t_injected * x2_pos_epsilon)
-        x2_x_t_1 = x2_x_t
-    
-        # reverse denoising step - x3
-        x3_pos_t_1 = ((1. / float(x3_alpha_t)) * x3_pos_t)  - ((x3_var_dash_t/(x3_alpha_t * x3_sigma_dash_t)) * x3_pos_out)  +  (x3_c_t_injected * x3_pos_epsilon)
-        x3_x_t_1 = ((1. / x3_alpha_t) * x3_x_t)  - ((x3_var_dash_t/(x3_alpha_t * x3_sigma_dash_t)) * x3_x_out)  +  (x3_c_t * x3_x_epsilon)
-    
-        # reverse denoising step - x4
-        x4_pos_t_1 = ((1. / float(x4_alpha_t)) * x4_pos_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_pos_out)  +  (x4_c_t_injected * x4_pos_epsilon)
-        x4_direction_t_1 = ((1. / float(x4_alpha_t)) * x4_direction_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_direction_out)  +  (x4_c_t * x4_direction_epsilon)
-        x4_x_t_1 = ((1. / x4_alpha_t) * x4_x_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_x_out)  +  (x4_c_t * x4_x_epsilon)
-    
-        
-        # resetting virtual nodes
-        x1_pos_t_1[virtual_node_mask_x1] = x1_pos_t[virtual_node_mask_x1]
-        x1_x_t_1[virtual_node_mask_x1] = x1_x_t[virtual_node_mask_x1]
-        
-        x2_pos_t_1[virtual_node_mask_x2] = x2_pos_t[virtual_node_mask_x2]
-        x2_x_t_1[virtual_node_mask_x2] = x2_x_t[virtual_node_mask_x2]
-        
-        x3_pos_t_1[virtual_node_mask_x3] = x3_pos_t[virtual_node_mask_x3]
-        x3_x_t_1[virtual_node_mask_x3] = x3_x_t[virtual_node_mask_x3]
-        
-        x4_pos_t_1[virtual_node_mask_x4] = x4_pos_t[virtual_node_mask_x4]
-        x4_direction_t_1[virtual_node_mask_x4] = x4_direction_t[virtual_node_mask_x4]
-        x4_x_t_1[virtual_node_mask_x4] = x4_x_t[virtual_node_mask_x4]
+        # Perform reverse denoising step using helper function
+        next_state = _perform_reverse_denoising_step(
+            t, batch_size, noise_params,
+            x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, x1_pos_out, x1_x_out, x1_bond_edge_x_out,
+            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_pos_out,
+            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_pos_out, x3_x_out,
+            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_pos_out, x4_direction_out, x4_x_out,
+            denoising_noise_scale, inject_noise_at_ts, inject_noise_scales
+        )
+
+        # Unpack next state
+        x1_pos_t_1 = next_state['x1_pos_t_1']
+        x1_x_t_1 = next_state['x1_x_t_1']
+        x1_bond_edge_x_t_1 = next_state['x1_bond_edge_x_t_1']
+        x2_pos_t_1 = next_state['x2_pos_t_1']
+        x2_x_t_1 = next_state['x2_x_t_1']
+        x3_pos_t_1 = next_state['x3_pos_t_1']
+        x3_x_t_1 = next_state['x3_x_t_1']
+        x4_pos_t_1 = next_state['x4_pos_t_1']
+        x4_direction_t_1 = next_state['x4_direction_t_1']
+        x4_x_t_1 = next_state['x4_x_t_1']
         
         
         # saving intermediate states for visualization / tracking
