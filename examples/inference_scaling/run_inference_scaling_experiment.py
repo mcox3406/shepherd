@@ -25,6 +25,7 @@ from shepherd.inference_scaling import (
     ShepherdModelRunner,
     SAScoreVerifier,
     CLogPVerifier,
+    QEDVerifier,
     MultiObjectiveVerifier,
     RandomSearch,
     ZeroOrderSearch,
@@ -78,6 +79,8 @@ def parse_args():
                         help='Weight for synthetic accessibility score')
     parser.add_argument('--clogp_weight', type=float, default=0.0,
                         help='Weight for cLogP score')
+    parser.add_argument('--qed_weight', type=float, default=0.0,
+                        help='Weight for QED (drug-likeness) score')
     
     # output control
     parser.add_argument('--output_dir', type=str, default='inference_scaling_experiments',
@@ -163,6 +166,7 @@ def save_results(results, output_path):
         'nfe': results.get('nfe', 0),
         'best_sa_score': results.get('best_sa_score'),
         'best_clogp_score': results.get('best_clogp_score'),
+        'best_qed_score': results.get('best_qed_score'),
         'config': results.get('config', {})
     }
     
@@ -221,7 +225,7 @@ def run_experiment(args):
 
     # initialize CSV log file
     log_header = ['filename', 'algorithm', 'iteration', 'sub_iteration', 'is_initial', 'is_elite',
-                  'smiles', 'sa_score', 'clogp_score', 'combined_score']
+                  'smiles', 'sa_score', 'clogp_score', 'qed_score', 'combined_score']
     with open(all_mols_log_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(log_header)
@@ -273,7 +277,8 @@ def run_experiment(args):
         print("Creating verifiers")
         sa_verifier = SAScoreVerifier(weight=args.sa_weight)
         clogp_verifier = CLogPVerifier(weight=args.clogp_weight)
-        multi_verifier = MultiObjectiveVerifier([sa_verifier, clogp_verifier])
+        qed_verifier = QEDVerifier(weight=args.qed_weight)
+        multi_verifier = MultiObjectiveVerifier([sa_verifier, clogp_verifier, qed_verifier])
         
         def comprehensive_save_callback(**kwargs):
             try:
@@ -303,6 +308,7 @@ def run_experiment(args):
                 # 3. calculate individual properties and smiles
                 sa_score = sa_verifier(sample)
                 clogp_score = clogp_verifier(sample)
+                qed_score = qed_verifier(sample)
                 smiles = "error_creating_mol"
                 try:
                     mol = create_rdkit_molecule(sample)
@@ -314,7 +320,7 @@ def run_experiment(args):
 
                 # 4. append to csv log
                 log_row = [filename_xyz, algorithm, iteration, sub_iteration, is_initial, is_elite,
-                           smiles, sa_score, clogp_score, combined_score]
+                           smiles, sa_score, clogp_score, qed_score, combined_score]
                 with open(all_mols_log_path, 'a', newline='') as csvfile:
                     writer = csv.writer(csvfile)
                     writer.writerow(log_row)
@@ -414,11 +420,13 @@ def run_experiment(args):
 
         best_sa_score = None
         best_clogp_score = None
+        best_qed_score = None
         if best_sample is not None:
             try:
                 best_sa_score = sa_verifier(best_sample)
                 best_clogp_score = clogp_verifier(best_sample)
-                print(f"Best Individual Scores - SA: {best_sa_score:.4f}, cLogP: {best_clogp_score:.4f}")
+                best_qed_score = qed_verifier(best_sample)
+                print(f"Best Individual Scores - SA: {best_sa_score:.4f}, cLogP: {best_clogp_score:.4f}, QED: {best_qed_score:.4f}")
             except Exception as e:
                 logging.warning(f"Could not calculate individual scores for best sample: {e}")
 
@@ -426,7 +434,8 @@ def run_experiment(args):
         results.update({
             'nfe': nfe,
             'best_sa_score': best_sa_score,
-            'best_clogp_score': best_clogp_score
+            'best_clogp_score': best_clogp_score,
+            'best_qed_score': best_qed_score
         })
 
         save_results(results, output_path)

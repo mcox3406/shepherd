@@ -259,24 +259,33 @@ def draw_best_molecules(summaries, output_dir):
     """Draw and save images of the best molecules from each experiment"""
     mols = []
     labels = []
-    
+    logging.info("Attempting to draw best molecules...")
+
     for summary in summaries:
-        if 'best_smiles' in summary:
+        exp_name = summary.get('experiment_name', 'UnknownExp')
+        if 'best_smiles' in summary and summary['best_smiles'] and not isinstance(summary['best_smiles'], (int, float)) :
+            smiles_str = summary['best_smiles']
+            logging.info(f"Found SMILES '{smiles_str}' for {exp_name}")
             try:
-                mol = Chem.MolFromSmiles(summary['best_smiles'])
+                mol = Chem.MolFromSmiles(smiles_str)
                 if mol is not None:
+                    logging.info(f"Successfully created RDKit Mol for {exp_name}")
                     mols.append(mol)
-                    
                     # create label with experiment name and score
-                    label = f"{summary['experiment_name']}\nScore: {summary['best_score']:.4f}"
+                    label = f"{exp_name}\nScore: {summary['best_score']:.4f}"
                     labels.append(label)
-            except:
-                pass
-    
+                else:
+                    logging.warning(f"RDKit MolFromSmiles returned None for SMILES '{smiles_str}' from {exp_name}")
+            except Exception as e:
+                logging.error(f"Error processing SMILES '{smiles_str}' for {exp_name}: {e}")
+        else:
+            logging.warning(f"No valid 'best_smiles' key found in summary for {exp_name}. Summary keys: {list(summary.keys())}")
+
     if not mols:
-        print("No valid molecules to draw")
+        logging.warning("No valid molecules could be generated to draw.")
         return
-    
+
+    logging.info(f"Drawing grid image for {len(mols)} molecules.")
     # draw molecules in a grid
     img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(300, 300), legends=labels)
     img.save(output_dir / "best_molecules.png")

@@ -13,6 +13,7 @@ from pathlib import Path
 import pickle
 from copy import deepcopy
 import importlib.util
+from unittest.mock import patch
 
 # check if RDKit is available
 rdkit_available = importlib.util.find_spec("rdkit") is not None
@@ -34,6 +35,7 @@ from shepherd.inference_scaling import (
     Verifier,
     SAScoreVerifier,
     CLogPVerifier,
+    QEDVerifier,
     create_rdkit_molecule
 )
 
@@ -239,19 +241,22 @@ def test_sa_score_with_explicit_mol():
 
 @pytest.mark.skipif(not rdkit_import_success, reason="RDKit not properly installed")
 def test_clogp_with_explicit_mol():
-    """Test the cLogP verifier with an explicitly created molecule."""
+    """Test the cLogP verifier with continuous scaling using an explicitly created molecule."""
     mol = create_methanol_mol()
     assert mol is not None, "Failed to create test molecule"
     
     verifier = CLogPVerifier()
     
-    score = verifier(mol)
+    # Patch Crippen.MolLogP to return a known value for testing
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=1.5):
+        score = verifier(mol)
+        
+        assert score is not None, "Failed to calculate cLogP score"
+        # For logP=1.5 with range (-1, 4), expected score is (1.5 - (-1))/(4-(-1)) = 2.5/5 = 0.5
+        assert pytest.approx(score, abs=1e-5) == 0.5
+        assert 0.0 <= score <= 1.0, "cLogP score should be in [0,1]"
     
-    assert score is not None, "Failed to calculate cLogP score"
-    assert score >= 0.0, "cLogP score should be >= 0"
-    assert score <= 1.0, "cLogP score should be <= 1"
-    
-    print(f"Calculated cLogP score: {score}")
+    print(f"Calculated cLogP score with continuous scaling successfully")
 
 
 @pytest.mark.skipif(not rdkit_import_success, reason="RDKit not properly installed")
@@ -291,18 +296,34 @@ def test_sa_score_verifier(sample_methanol, patched_verifier, monkeypatch):
 
 @pytest.mark.skipif(not rdkit_import_success, reason="RDKit not properly installed")
 def test_clogp_verifier(sample_methanol, patched_verifier, monkeypatch):
-    """Test that the cLogP verifier works with our test molecules."""
+    """Test that the cLogP verifier with continuous scaling works with our test molecules."""
     try:
         verifier = CLogPVerifier()
         monkeypatch.setattr(verifier, "preprocess", preprocess_test_sample)
         
-        score = verifier(sample_methanol)
+        # patch Crippen.MolLogP to return a known value for testing
+        with patch('rdkit.Chem.Crippen.MolLogP', return_value=1.5):
+            score = verifier(sample_methanol)
+            
+            assert score is not None, "Failed to calculate cLogP score"
+            # For logP=1.5 with range (-1, 4), expected score is (1.5 - (-1))/(4-(-1)) = 2.5/5 = 0.5
+            assert pytest.approx(score, abs=1e-5) == 0.5
+            assert 0.0 <= score <= 1.0, "cLogP score should be in [0,1]"
         
-        assert score is not None, "Failed to calculate cLogP score"
-        assert score >= 0.0, "cLogP score should be >= 0"
-        assert score <= 1.0, "cLogP score should be <= 1"
+        # test other values
+        for logp_value, expected_score in [
+            (-1.0, 0.0),     # lower bound
+            (4.0, 1.0),      # upper bound
+            (-2.0, 0.0),     # below lower bound, clamped
+            (5.0, 1.0),      # above upper bound, clamped
+            (0.0, 0.2),      # 20% of the way from -1 to 4
+            (2.5, 0.7)       # 70% of the way from -1 to 4
+        ]:
+            with patch('rdkit.Chem.Crippen.MolLogP', return_value=logp_value):
+                score = verifier(sample_methanol)
+                assert pytest.approx(score, abs=1e-5) == expected_score, f"LogP {logp_value} should map to {expected_score}"
         
-        print(f"Calculated cLogP score: {score}")
+        print(f"Calculated cLogP scores with continuous scaling successfully")
         
     except Exception as e:
         pytest.fail(f"cLogP calculation failed: {e}")
@@ -342,4 +363,47 @@ def test_parse_molecule_from_inference_output():
         print(f"SA Score: {sa_score}, cLogP Score: {clogp_score}")
         
     except Exception as e:
-        pytest.fail(f"Failed to parse molecule from inference output: {e}") 
+        pytest.fail(f"Failed to parse molecule from inference output: {e}")
+
+
+@pytest.mark.skipif(not rdkit_import_success, reason="RDKit not properly installed")
+def test_qed_with_explicit_mol():
+    """Test QED score calculation with a molecule created with explicit bonds."""
+    # create methanol molecule with explicit bonds
+    mol = create_methanol_mol()
+    if mol is None:
+        pytest.skip("Failed to create methanol molecule")
+    
+    # create QED verifier
+    verifier = QEDVerifier()
+    
+    # apply the verifier
+    qed_score = verifier(mol)
+    
+    # QED score should be between 0 and 1
+    assert 0 <= qed_score <= 1
+    assert isinstance(qed_score, float)
+
+
+@pytest.mark.skipif(not rdkit_import_success, reason="RDKit not properly installed")
+def test_qed_verifier(sample_methanol, patched_verifier, monkeypatch):
+    """Test that QED verifier can calculate QED for a simple molecule."""
+    # Create a QED verifier with the patched preprocess method
+    qed_verifier = QEDVerifier()
+    monkeypatch.setattr(qed_verifier, 'preprocess', patched_verifier.preprocess)
+    
+    # measure QED score
+    qed_score = qed_verifier(sample_methanol)
+    
+    # score should be between 0 and 1
+    assert 0 <= qed_score <= 1
+    assert isinstance(qed_score, float)
+    
+    # test with custom weights
+    custom_weights = (0.66, 0.46, 0.05, 0.61, 0.06, 0.65, 0.48, 0.95)
+    custom_qed_verifier = QEDVerifier(custom_weights=custom_weights)
+    monkeypatch.setattr(custom_qed_verifier, 'preprocess', patched_verifier.preprocess)
+    
+    custom_qed_score = custom_qed_verifier(sample_methanol)
+    assert 0 <= custom_qed_score <= 1
+    assert isinstance(custom_qed_score, float) 

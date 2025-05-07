@@ -13,6 +13,7 @@ from rdkit.Chem import AllChem
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem import RDConfig
+from rdkit.Chem import QED
 import os
 import sys
 import logging
@@ -147,14 +148,14 @@ class SAScoreVerifier(Verifier):
 class CLogPVerifier(Verifier):
     """Verifier for calculated LogP values in a druglike range."""
     
-    def __init__(self, weight=1.0, target_range=(0.4, 5.0)):
+    def __init__(self, weight=1.0, target_range=(-1.0, 4.0)):
         """
         Initialize the cLogP verifier.
         
         Args:
             weight (float): Weight of the verifier in multi-objective optimization.
-            target_range (tuple): The ideal range for cLogP values. Values outside
-                                  this range will be penalized.
+            target_range (tuple): The range for cLogP values to be scaled from.
+                                  Default is (-1.0, 4.0) for typical drug-like molecules.
         """
         super().__init__("cLogP", weight)
         self.target_range = target_range
@@ -163,13 +164,13 @@ class CLogPVerifier(Verifier):
         
     def __call__(self, mol_input):
         """
-        Calculate a score based on how well the cLogP value fits in a druglike range.
+        Calculate a score based on cLogP with continuous scaling.
         
         Args:
             mol_input: RDKit Mol object or ShEPhERD generation output.
             
         Returns:
-            float: Score between 0 and 1, where higher is better.
+            float: Score between 0 and 1, where higher is better (in ideal range).
         """
         if isinstance(mol_input, dict):
             mol = self.preprocess(mol_input)
@@ -182,23 +183,65 @@ class CLogPVerifier(Verifier):
         try:
             logp = self._crippen.MolLogP(mol)
             
-            min_range, max_range = self.target_range
-            if min_range <= logp <= max_range:
-                # within range gets full score
-                return 1.0
-            elif logp < min_range:
-                # too hydrophilic
-                distance = min_range - logp
-                penalty = min(1.0, distance / 2.0)  # gradually reduce score
-                return 1.0 - penalty
-            else:  # logp > max_range
-                # too lipophilic
-                distance = logp - max_range
-                penalty = min(1.0, distance / 3.0)  # gradually reduce score
-                return 1.0 - penalty
+            # continuous scaling using min-max normalization
+            lower_bound, upper_bound = self.target_range
+            
+            # clamp the value to the range
+            clamped_logp = min(max(logp, lower_bound), upper_bound)
+            
+            # scale to [0, 1] range
+            normalized_score = (clamped_logp - lower_bound) / (upper_bound - lower_bound)
+            
+            return normalized_score
         
         except Exception as e:
             logging.warning(f"Error calculating cLogP: {e}")
+            return 0.0
+
+
+class QEDVerifier(Verifier):
+    """Quantitative Estimate of Drug-likeness (QED) verifier."""
+    
+    def __init__(self, weight=1.0, custom_weights=None):
+        """
+        Initialize the QED verifier.
+        
+        Args:
+            weight (float): Weight of the verifier in multi-objective optimization.
+            custom_weights (tuple, optional): Custom weights for QED calculation.
+                                            Default weights are (0.66, 0.46, 0.05, 0.61, 0.06, 0.65, 0.48, 0.95)
+        """
+        super().__init__("QED", weight)
+        self.custom_weights = custom_weights
+        
+    def __call__(self, mol_input):
+        """
+        Calculate the QED score for a molecule.
+        
+        Args:
+            mol_input: RDKit Mol object or ShEPhERD generation output.
+            
+        Returns:
+            float: QED score between 0 and 1, where higher is better.
+        """
+        if isinstance(mol_input, dict):
+            mol = self.preprocess(mol_input)
+        else:
+            mol = mol_input
+            
+        if mol is None:
+            return 0.0
+        
+        try:
+            if self.custom_weights:
+                qed_score = QED.qed(mol, w=self.custom_weights)
+            else:
+                qed_score = QED.qed(mol)
+            
+            return qed_score  # QED is already normalized between 0 and 1
+        
+        except Exception as e:
+            logging.warning(f"Error calculating QED score: {e}")
             return 0.0
 
 
