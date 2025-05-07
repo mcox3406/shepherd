@@ -11,6 +11,8 @@ from copy import deepcopy
 import os
 from tqdm import tqdm
 import sys
+from functools import partial
+from typing import Optional
 
 sys.path.insert(-1, "../model/")
 sys.path.insert(-1, "../model/equiformer_v2")
@@ -32,7 +34,9 @@ from .noise import (
 )
 from .steps import (
     _perform_reverse_denoising_step,
-    _prepare_model_input
+    _prepare_model_input,
+    _inference_step,
+    _pack_inpainting_dict
 )
 
 from shepherd.shepherd_score_utils.generate_point_cloud import (
@@ -98,7 +102,11 @@ def inference_sample(
     pharm_types = np.zeros(5, dtype = int),
     pharm_pos = np.zeros((5,3)),
     pharm_direction = np.zeros((5,3)),
-    
+    save_intermediate = False,
+
+    start_t_ind: int = 0,
+    xi_initial_dict: Optional[dict] = None,
+    noise_dict: Optional[dict] = None,
 ):
     """
     Runs inference of ShEPhERD to sample `batch_size` number of molecules.
@@ -161,6 +169,20 @@ def inference_sample(
     pharm_direction : np.ndarray (<=N_x4,3) (default = np.zeros((5,3))) Pharmacophore directions as
         unit vectors.
 
+    save_intermediate : bool (default=False)
+        whether to save intermediates --> not implemented
+
+    start_t_ind : int (default = 0)
+        Index of the time step to start from (default is from pure noise).
+        Requires xi_initial_dict to be provided.
+    xi_initial_dict : Optional[dict] (default = None)
+        Dictionary containing the initial states of x1, x2, x3, and x4.
+        If None, the states are initialized randomly.
+    noise_dict: Optional[dict] (default = None)
+        Dictionary containing the noise parameters for the *first* inference step.
+        After the first inference step, the noise will be sampled randomly.
+        If None, the noises will be sampled randomly.
+
     Returns
     -------
     generated_structures : List[Dict]
@@ -208,9 +230,21 @@ def inference_sample(
 
     N_x2 = params['dataset']['x2']['num_points']
     N_x3 = params['dataset']['x3']['num_points']
+
+    if start_t_ind != 0 and xi_initial_dict is None:
+        raise ValueError("xi_initial_dict must be provided if start_t_ind is not 0.")
     
     
     ####### Defining inpainting targets ########
+
+    # override conditioning options
+    if unconditional:
+        inpaint_x2_pos = False
+        inpaint_x3_pos = False
+        inpaint_x3_x = False
+        inpaint_x4_pos = False
+        inpaint_x4_direction = False
+        inpaint_x4_type = False
 
     do_partial_inpainting = False
     assert len(pharm_direction) == len(pharm_pos) and len(pharm_pos) == len(pharm_types)
@@ -266,81 +300,84 @@ def inference_sample(
     deterministic_inpainting_x2 = False
     deterministic_inpainting_x3 = False
     deterministic_inpainting_x4 = False
+
+    x2_pos_inpainting_trajectory = None
+    x3_pos_inpainting_trajectory = None
+    x3_x_inpainting_trajectory = None
+    x4_pos_inpainting_trajectory = None
+    x4_direction_inpainting_trajectory = None
+    x4_x_inpainting_trajectory = None
     
-    x2_pos_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x2_pos,
-        
-        ts = params['noise_schedules']['x2']['ts'],
-        alpha_ts = params['noise_schedules']['x2']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x2']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x2_mask,
-        deterministic = deterministic_inpainting_x2,
-    )
+    if inpaint_x2_pos:
+        x2_pos_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x2_pos,
+            
+            ts = params['noise_schedules']['x2']['ts'],
+            alpha_ts = params['noise_schedules']['x2']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x2']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x2_mask,
+            deterministic = deterministic_inpainting_x2,
+        )
     
-    x3_pos_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x3_pos,
-        
-        ts = params['noise_schedules']['x3']['ts'],
-        alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x3_mask,
-        deterministic = deterministic_inpainting_x3,
-    )
-    x3_x_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x3_x,
-        
-        ts = params['noise_schedules']['x3']['ts'],
-        alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x3_mask,
-        deterministic = deterministic_inpainting_x3,
-    )
+    if inpaint_x3_pos:
+        x3_pos_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x3_pos,
+            
+            ts = params['noise_schedules']['x3']['ts'],
+            alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x3_mask,
+            deterministic = deterministic_inpainting_x3,
+        )
+    if inpaint_x3_x:
+        x3_x_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x3_x,
+            
+            ts = params['noise_schedules']['x3']['ts'],
+            alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x3_mask,
+            deterministic = deterministic_inpainting_x3,
+        )
     
-    x4_x_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x4_x,
-        
-        ts = params['noise_schedules']['x4']['ts'],
-        alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x4_mask,
-        deterministic = deterministic_inpainting_x4,
-    )
-    x4_pos_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x4_pos,
-        
-        ts = params['noise_schedules']['x4']['ts'],
-        alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x4_mask,
-        deterministic = deterministic_inpainting_x4,
-    )
-    x4_direction_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x4_direction,
-        
-        ts = params['noise_schedules']['x4']['ts'],
-        alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x4_mask,
-        deterministic = deterministic_inpainting_x4,
-    )
+    if inpaint_x4_type:
+        x4_x_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x4_x,
+            
+            ts = params['noise_schedules']['x4']['ts'],
+            alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x4_mask,
+            deterministic = deterministic_inpainting_x4,
+        )
+    if inpaint_x4_pos:
+        x4_pos_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x4_pos,
+            
+            ts = params['noise_schedules']['x4']['ts'],
+            alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x4_mask,
+            deterministic = deterministic_inpainting_x4,
+        )
+    if inpaint_x4_direction:
+        x4_direction_inpainting_trajectory = forward_trajectory(
+            x = target_inpaint_x4_direction,
+            
+            ts = params['noise_schedules']['x4']['ts'],
+            alpha_ts = params['noise_schedules']['x4']['alpha_ts'],
+            sigma_ts = params['noise_schedules']['x4']['sigma_ts'],
+            remove_COM_from_noise = False,
+            mask = target_inpaint_x4_mask,
+            deterministic = deterministic_inpainting_x4,
+        )
 
     ####################################
-
-    
-    # override conditioning options
-    if unconditional:
-        inpaint_x2_pos = False
-        inpaint_x3_pos = False
-        inpaint_x3_x = False
-        inpaint_x4_pos = False
-        inpaint_x4_direction = False
-        inpaint_x4_type = False
         
     stop_inpainting_at_time_x2 = int(T*stop_inpainting_at_time_x2)
     stop_inpainting_at_time_x3 = int(T*stop_inpainting_at_time_x3)
@@ -353,27 +390,57 @@ def inference_sample(
     num_atom_types = len(params['dataset']['x1']['atom_types']) + len(params['dataset']['x1']['charge_types'])
     num_pharm_types = params['dataset']['x4']['max_node_types'] # needed later for inpainting
 
-    # Initialize x1 state
-    (pos_forward_noised_x1, x_forward_noised_x1, bond_edge_x_forward_noised_x1, 
-     x1_batch, virtual_node_mask_x1, bond_edge_index_x1) = _initialize_x1_state(
-         batch_size, N_x1, params, prior_noise_scale, include_virtual_node
-     )
-    
-    # Initialize x2 state
-    pos_forward_noised_x2, x_forward_noised_x2, x2_batch, virtual_node_mask_x2 = _initialize_x2_state(
-        batch_size, N_x2, params, prior_noise_scale, include_virtual_node
-    )
+    if xi_initial_dict is not None:
+        # unpack xi_initial_dict
+        # x1 states
+        pos_forward_noised_x1 = xi_initial_dict['pos_forward_noised_x1']
+        x_forward_noised_x1 = xi_initial_dict['x_forward_noised_x1']
+        bond_edge_x_forward_noised_x1 = xi_initial_dict['bond_edge_x_forward_noised_x1']
+        x1_batch = xi_initial_dict['x1_batch']
+        virtual_node_mask_x1 = xi_initial_dict['virtual_node_mask_x1']
+        bond_edge_index_x1 = xi_initial_dict['bond_edge_index_x1']
 
-    # Initialize x3 state
-    pos_forward_noised_x3, x_forward_noised_x3, x3_batch, virtual_node_mask_x3 = _initialize_x3_state(
-        batch_size, N_x3, params, prior_noise_scale, include_virtual_node
-    )
+        # x2 states
+        pos_forward_noised_x2 = xi_initial_dict['pos_forward_noised_x2']
+        x_forward_noised_x2 = xi_initial_dict['x_forward_noised_x2']
+        x2_batch = xi_initial_dict['x2_batch']
+        virtual_node_mask_x2 = xi_initial_dict['virtual_node_mask_x2']
 
-    # Initialize x4 state
-    (pos_forward_noised_x4, direction_forward_noised_x4, x_forward_noised_x4, 
-     x4_batch, virtual_node_mask_x4) = _initialize_x4_state(
-         batch_size, N_x4, params, prior_noise_scale, include_virtual_node
-     )
+        # x3 states
+        pos_forward_noised_x3 = xi_initial_dict['pos_forward_noised_x3']
+        x_forward_noised_x3 = xi_initial_dict['x_forward_noised_x3']
+        x3_batch = xi_initial_dict['x3_batch']
+        virtual_node_mask_x3 = xi_initial_dict['virtual_node_mask_x3']
+
+        # x4 states
+        pos_forward_noised_x4 = xi_initial_dict['pos_forward_noised_x4']
+        direction_forward_noised_x4 = xi_initial_dict['direction_forward_noised_x4']
+        x_forward_noised_x4 = xi_initial_dict['x_forward_noised_x4']
+        x4_batch = xi_initial_dict['x4_batch']
+        virtual_node_mask_x4 = xi_initial_dict['virtual_node_mask_x4']
+
+    else:
+        # Initialize x1 state
+        (pos_forward_noised_x1, x_forward_noised_x1, bond_edge_x_forward_noised_x1, 
+        x1_batch, virtual_node_mask_x1, bond_edge_index_x1) = _initialize_x1_state(
+            batch_size, N_x1, params, prior_noise_scale, include_virtual_node
+        )
+        
+        # Initialize x2 state
+        pos_forward_noised_x2, x_forward_noised_x2, x2_batch, virtual_node_mask_x2 = _initialize_x2_state(
+            batch_size, N_x2, params, prior_noise_scale, include_virtual_node
+        )
+
+        # Initialize x3 state
+        pos_forward_noised_x3, x_forward_noised_x3, x3_batch, virtual_node_mask_x3 = _initialize_x3_state(
+            batch_size, N_x3, params, prior_noise_scale, include_virtual_node
+        )
+
+        # Initialize x4 state
+        (pos_forward_noised_x4, direction_forward_noised_x4, x_forward_noised_x4, 
+        x4_batch, virtual_node_mask_x4) = _initialize_x4_state(
+            batch_size, N_x4, params, prior_noise_scale, include_virtual_node
+        )
 
 
     # renaming variables for consistency
@@ -391,16 +458,15 @@ def inference_sample(
     x4_direction_t = direction_forward_noised_x4
     x4_x_t = x_forward_noised_x4
     
-    
     x1_batch_size_nodes = x1_pos_t.shape[0]
     x2_batch_size_nodes = x2_pos_t.shape[0]
     x3_batch_size_nodes = x3_pos_t.shape[0]
     x4_batch_size_nodes = x4_pos_t.shape[0]
     
-    x1_t = params['noise_schedules']['x1']['ts'][::-1][0]
-    x2_t = params['noise_schedules']['x2']['ts'][::-1][0]
-    x3_t = params['noise_schedules']['x3']['ts'][::-1][0]
-    x4_t = params['noise_schedules']['x4']['ts'][::-1][0]
+    x1_t = params['noise_schedules']['x1']['ts'][::-1][start_t_ind]
+    x2_t = params['noise_schedules']['x2']['ts'][::-1][start_t_ind]
+    x3_t = params['noise_schedules']['x3']['ts'][::-1][start_t_ind]
+    x4_t = params['noise_schedules']['x4']['ts'][::-1][start_t_ind]
     
     t = x1_t
     assert x1_t == x2_t
@@ -458,312 +524,89 @@ def inference_sample(
     
     
     ######## Main Denoising Loop #########
-    
+
+    if save_intermediate:
+        x1_t_x_list = []
+        x1_t_bond_edge_x_list = []
+        x1_t_pos_list = []
+        
+        x2_t_pos_list = []
+        
+        x3_t_pos_list = []
+        x3_t_x_list = []
+        
+        x4_t_pos_list = []
+        x4_t_direction_list = []
+        x4_t_x_list = []
+
+    inpainting_dict = _pack_inpainting_dict(
+        x2_pos_inpainting_trajectory=x2_pos_inpainting_trajectory,
+        x3_pos_inpainting_trajectory=x3_pos_inpainting_trajectory, x3_x_inpainting_trajectory=x3_x_inpainting_trajectory,
+        x4_pos_inpainting_trajectory=x4_pos_inpainting_trajectory,
+        x4_direction_inpainting_trajectory=x4_direction_inpainting_trajectory,
+        x4_x_inpainting_trajectory=x4_x_inpainting_trajectory,
+        stop_inpainting_at_time_x2=stop_inpainting_at_time_x2,
+        stop_inpainting_at_time_x3=stop_inpainting_at_time_x3,
+        stop_inpainting_at_time_x4=stop_inpainting_at_time_x4,
+        add_noise_to_inpainted_x2_pos=add_noise_to_inpainted_x2_pos,
+        add_noise_to_inpainted_x3_pos=add_noise_to_inpainted_x3_pos,
+        add_noise_to_inpainted_x3_x=add_noise_to_inpainted_x3_x,
+        add_noise_to_inpainted_x4_pos=add_noise_to_inpainted_x4_pos,
+        add_noise_to_inpainted_x4_direction=add_noise_to_inpainted_x4_direction,
+        add_noise_to_inpainted_x4_type=add_noise_to_inpainted_x4_type,
+        do_partial_inpainting=do_partial_inpainting,
+    )
+
+    inference_step = partial(
+        _inference_step,
+        model_pl=model_pl,
+        params=params,
+        time_steps=time_steps,
+        harmonize=harmonize, harmonize_ts=harmonize_ts, harmonize_jumps=harmonize_jumps,
+        batch_size=batch_size,
+        sampler_type=sampler_type, ddim_eta=ddim_eta,
+        denoising_noise_scale=denoising_noise_scale,
+        inject_noise_at_ts=inject_noise_at_ts, inject_noise_scales=inject_noise_scales,
+        virtual_node_mask_x1=virtual_node_mask_x1,
+        virtual_node_mask_x2=virtual_node_mask_x2,
+        virtual_node_mask_x3=virtual_node_mask_x3,
+        virtual_node_mask_x4=virtual_node_mask_x4,
+        # inpainting
+        inpaint_x2_pos=inpaint_x2_pos, inpaint_x3_pos=inpaint_x3_pos, inpaint_x3_x=inpaint_x3_x,
+        inpaint_x4_pos=inpaint_x4_pos, inpaint_x4_direction=inpaint_x4_direction,
+        inpaint_x4_type=inpaint_x4_type,
+        inpainting_dict=inpainting_dict,
+    )
+
     pbar = tqdm(total=len(time_steps) -1 + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
     
-    x1_t_x_list = []
-    x1_t_bond_edge_x_list = []
-    x1_t_pos_list = []
-    
-    x2_t_pos_list = []
-    
-    x3_t_pos_list = []
-    x3_t_x_list = []
-    
-    x4_t_pos_list = []
-    x4_t_direction_list = []
-    x4_t_x_list = []
-    
-    current_time_idx = 0
+    current_time_idx = start_t_ind
     while current_time_idx < len(time_steps) - 1:
-        current_t = time_steps[current_time_idx]
-        prev_t = time_steps[current_time_idx + 1] # The time we are calculating state FOR
-        
-        # t passed to helpers/model should be current time
-        t = current_t 
-
-        # inputs (these might be redundant now, t is the main driver)
-        x1_t = t
-        x2_t = t
-        x3_t = t
-        x4_t = t
-        
-        # harmonize
-        # harmonization needs careful consideration with subsequenced timesteps
-        # for now, we only harmonize if t is exactly in harmonize_ts
-        # a jump might skip over a harmonize_ts value in DDIM
-        # if harmonization is used with DDIM, ensure harmonize_ts align with time_steps
-        perform_harmonization_jump = False
-        harmonize_jump_len = 0
-        if (harmonize) and (len(harmonize_ts) > 0) and (t == harmonize_ts[0]):
-            print(f'Harmonizing... at time {t}')
-            harmonize_ts.pop(0)
-            if len(harmonize_ts) == 0:
-                harmonize = False # use up harmonization steps
-            harmonize_jump_len = harmonize_jumps.pop(0)
-            perform_harmonization_jump = True
-            
-        if perform_harmonization_jump:
-            x1_sigma_ts = params['noise_schedules']['x1']['sigma_ts']
-            x2_sigma_ts = params['noise_schedules']['x2']['sigma_ts']
-            x3_sigma_ts = params['noise_schedules']['x3']['sigma_ts']
-            x4_sigma_ts = params['noise_schedules']['x4']['sigma_ts']
-            
-            x1_pos_t, x1_t_jump = forward_jump(x1_pos_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = True, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_x_t, x1_t_jump = forward_jump(x1_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_bond_edge_x_t, x1_t_jump = forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = None, mask = None)
-            
-            x2_pos_t, x2_t_jump = forward_jump(x2_pos_t, x2_t, harmonize_jump_len, x2_sigma_ts, remove_COM_from_noise = False, batch = x2_batch, mask = ~virtual_node_mask_x2)
-            
-            x3_pos_t, x3_t_jump = forward_jump(x3_pos_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
-            x3_x_t, x3_t_jump = forward_jump(x3_x_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
-            
-            x4_pos_t, x4_t_jump = forward_jump(x4_pos_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-            x4_direction_t, x4_t_jump = forward_jump(x4_direction_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-            x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-    
-            # after jumping forward, we need to find the corresponding index in our time_steps
-            # this simple implementation assumes the jump lands exactly on a future step in the sequence
-            # more robust: find the closest step in the sequence
-            jumped_to_t = x1_t_jump # assuming all jumps are same length
-            try:
-                # find where the jumped-to time occurs in the sequence
-                jump_to_idx = np.where(time_steps == jumped_to_t)[0][0]
-                # reset the loop index to continue from the jumped-to time
-                current_time_idx = jump_to_idx
-                pbar.update(harmonize_jump_len) # update progress bar for the jumped steps
-                print(f"Harmonization jumped from t={t} to t={jumped_to_t}, resuming loop.")
-                t = jumped_to_t # update t for the next iteration start
-                # need to re-fetch noise params for the new 't' before proceeding if the loop continued immediately,
-                # but we will recalculate at the start of the next iteration anyway
-                continue # skip the rest of the current loop iteration (denoising step)
-            except IndexError:
-                 print(f"Warning: Harmonization jumped from t={t} to t={jumped_to_t}, which is not in the planned time_steps sequence {time_steps}. Stopping Harmonization.")
-                 harmonize = False # disable future harmonization if jump is incompatible
-                 # continue the loop from the *next* scheduled step after the original t
-
-        # inpainting logic
-        if (x2_t > stop_inpainting_at_time_x2) and inpaint_x2_pos:
-            x2_pos_t = torch.cat([x2_pos_inpainting_trajectory[x2_t] for _ in range(batch_size)], dim = 0)        
-            noise = torch.randn_like(x2_pos_t)
-            noise[virtual_node_mask_x2] = 0.0
-            x2_pos_t = x2_pos_t + add_noise_to_inpainted_x2_pos * noise
-        
-        if (x3_t > stop_inpainting_at_time_x3):
-            if inpaint_x3_pos:
-                x3_pos_t = torch.cat([x3_pos_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)        
-                noise = torch.randn_like(x3_pos_t)
-                noise[virtual_node_mask_x3] = 0.0
-                x3_pos_t = x3_pos_t + add_noise_to_inpainted_x3_pos * noise
-            if inpaint_x3_x:
-                x3_x_t = torch.cat([x3_x_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)
-                noise = torch.randn_like(x3_x_t)
-                noise[virtual_node_mask_x3] = 0.0
-                x3_x_t = x3_x_t + add_noise_to_inpainted_x3_x * noise
-        
-        if (x4_t > stop_inpainting_at_time_x4):
-            if inpaint_x4_pos:
-                x4_pos_t_inpaint = torch.cat([x4_pos_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
-                noise = torch.randn_like(x4_pos_t)
-                noise[virtual_node_mask_x4] = 0.0
-                if do_partial_inpainting:
-                    x4_pos_t_inpaint = x4_pos_t_inpaint.reshape(batch_size, -1, 3)
-                    noise = noise.reshape(batch_size, -1, 3)[:, :x4_pos_t_inpaint.shape[1]]
-
-                    x4_pos_t_inpaint = x4_pos_t_inpaint + add_noise_to_inpainted_x4_pos * noise
-                    x4_pos_t = x4_pos_t.reshape(batch_size, -1, 3)
-                    x4_pos_t[:, :x4_pos_t_inpaint.shape[1]] = x4_pos_t_inpaint
-                    x4_pos_t = x4_pos_t.reshape(-1, 3)
-                else:
-                    x4_pos_t_inpaint = x4_pos_t_inpaint + add_noise_to_inpainted_x4_pos * noise
-                    x4_pos_t = x4_pos_t_inpaint
-
-            if inpaint_x4_direction:
-                x4_direction_t_inpaint = torch.cat([x4_direction_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
-                noise = torch.randn_like(x4_direction_t)
-                noise[virtual_node_mask_x4] = 0.0
-                if do_partial_inpainting:
-                    x4_direction_t_inpaint = x4_direction_t_inpaint.reshape(batch_size, -1, 3)
-                    noise = noise.reshape(batch_size, -1, 3)[:, :x4_direction_t_inpaint.shape[1]]
-
-                    x4_direction_t_inpaint = x4_direction_t_inpaint + add_noise_to_inpainted_x4_direction * noise
-                    x4_direction_t = x4_direction_t.reshape(batch_size, -1, 3)
-                    x4_direction_t[:, :x4_direction_t_inpaint.shape[1]] = x4_direction_t_inpaint
-                    x4_direction_t = x4_direction_t.reshape(-1, 3)
-                else:
-                    x4_direction_t_inpaint = x4_direction_t_inpaint + add_noise_to_inpainted_x4_direction * noise
-                    x4_direction_t = x4_direction_t_inpaint
-            if inpaint_x4_type:
-                x4_x_t_inpaint = torch.cat([x4_x_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
-                noise = torch.randn_like(x4_x_t)
-                noise[virtual_node_mask_x4] = 0.0
-                if do_partial_inpainting:
-                    x4_x_t_inpaint = x4_x_t_inpaint.reshape(batch_size, -1, num_pharm_types)
-                    noise = noise.reshape(batch_size, -1, num_pharm_types)[:, :x4_x_t_inpaint.shape[1]]
-
-                    x4_x_t_inpaint = x4_x_t_inpaint + add_noise_to_inpainted_x4_type * noise
-                    x4_x_t = x4_x_t.reshape(batch_size, -1, num_pharm_types)
-                    x4_x_t[:, :x4_x_t_inpaint.shape[1]] = x4_x_t_inpaint
-                    x4_x_t = x4_x_t.reshape(-1, num_pharm_types)
-                else:
-                    x4_x_t_inpaint = x4_x_t_inpaint + add_noise_to_inpainted_x4_type * noise
-                    x4_x_t = x4_x_t_inpaint
-        
-        
-        # get noise parameters for current timestep t and previous timestep prev_t
-        noise_params_current = _get_noise_params_for_timestep(params, current_t)
-        noise_params_prev = _get_noise_params_for_timestep(params, prev_t) # Need params for interval end
-        
-        # pass only current params to model input preparation
-        x1_params_current = noise_params_current['x1']
-        x2_params_current = noise_params_current['x2']
-        x3_params_current = noise_params_current['x3']
-        x4_params_current = noise_params_current['x4']
-        
-        # get current data
-        input_dict = _prepare_model_input(
-            model_pl.model.device, torch.float32, batch_size, current_t,
-            x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params_current,
-            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params_current,
-            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params_current,
-            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params_current
-        )
-        
-
-        # predict noise with neural network    
-        with torch.no_grad():
-            _, output_dict = model_pl.model.forward(input_dict)
-        
-        x1_x_out = output_dict['x1']['decoder']['denoiser']['x_out'].detach().cpu()
-        x1_bond_edge_x_out = output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'].detach().cpu()
-        x1_pos_out = output_dict['x1']['decoder']['denoiser']['pos_out'].detach().cpu()
-        x1_pos_out = x1_pos_out - torch_scatter.scatter_mean(x1_pos_out[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim = 0)[x1_batch] # removing COM from predicted noise 
-        
-        x1_x_out[virtual_node_mask_x1, :] = 0.0
-        x1_pos_out[virtual_node_mask_x1, :] = 0.0
-        
-        
-        x2_pos_out = output_dict['x2']['decoder']['denoiser']['pos_out']
-        if x2_pos_out is not None:
-            x2_pos_out = x2_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x3
-            x2_pos_out[virtual_node_mask_x2, :] = 0.0
-        else:
-            x2_pos_out = torch.zeros_like(x2_pos_t)
-            
-        
-        x3_pos_out = output_dict['x3']['decoder']['denoiser']['pos_out']
-        x3_x_out = output_dict['x3']['decoder']['denoiser']['x_out']
-        if x3_pos_out is not None:
-            x3_pos_out = x3_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x3
-            x3_pos_out[virtual_node_mask_x3, :] = 0.0
-            
-            x3_x_out = x3_x_out.detach().cpu()
-            x3_x_out = x3_x_out.squeeze()
-            x3_x_out[virtual_node_mask_x3] = 0.0
-        else:
-            x3_pos_out = torch.zeros_like(x3_pos_t)
-            x3_x_out = torch.zeros_like(x3_x_t)
-        
-        
-        x4_x_out = output_dict['x4']['decoder']['denoiser']['x_out']
-        x4_pos_out = output_dict['x4']['decoder']['denoiser']['pos_out']
-        x4_direction_out = output_dict['x4']['decoder']['denoiser']['direction_out']
-        if x4_x_out is not None:
-            x4_pos_out = x4_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x4
-            x4_pos_out[virtual_node_mask_x4, :] = 0.0
-            
-            x4_direction_out = x4_direction_out.detach().cpu() # NOT removing COM from predicted positional noise for x4
-            x4_direction_out[virtual_node_mask_x4, :] = 0.0
-            
-            x4_x_out = x4_x_out.detach().cpu()
-            x4_x_out = x4_x_out.squeeze()
-            x4_x_out[virtual_node_mask_x4] = 0.0
-        
-        else:
-            x4_pos_out = torch.zeros_like(x4_pos_t)
-            x4_direction_out = torch.zeros_like(x4_direction_t)
-            x4_x_out = torch.zeros_like(x4_x_t)
-        
-        
-        
-        # Perform reverse denoising step using helper function
-        next_state = _perform_reverse_denoising_step(
-            current_t, # Pass current time t (tau_i)
-            prev_t,    # Pass previous time t-1 (tau_{i-1})
-            batch_size, 
-            noise_params_current, # Pass params for current time t
-            noise_params_prev,   # Pass params for previous time t-1
-            sampler_type,        # Pass sampler type
-            ddim_eta,            # Pass eta
-            # Current states (x_t)
-            x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, 
-            x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, 
-            x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, 
-            x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, 
-            # Model outputs (predicted noise or x0)
-            x1_pos_out, x1_x_out, x1_bond_edge_x_out,
-            x2_pos_out, 
-            x3_pos_out, x3_x_out,
-            x4_pos_out, x4_direction_out, x4_x_out,
-            # DDPM specific params (used conditionally within the step func)
-            denoising_noise_scale, inject_noise_at_ts, inject_noise_scales
+        current_time_idx, next_state = inference_step(
+            current_time_idx=current_time_idx,
+            x1_pos_t=x1_pos_t, x1_x_t=x1_x_t, x1_bond_edge_x_t=x1_bond_edge_x_t, x1_batch=x1_batch,
+            bond_edge_index_x1=bond_edge_index_x1,
+            x2_pos_t=x2_pos_t, x2_x_t=x2_x_t, x2_batch=x2_batch,
+            x3_pos_t=x3_pos_t, x3_x_t=x3_x_t, x3_batch=x3_batch,
+            x4_pos_t=x4_pos_t, x4_direction_t=x4_direction_t, x4_x_t=x4_x_t, x4_batch=x4_batch,
+            noise_dict=noise_dict,
+            pbar=pbar,
         )
 
-        # Unpack next state
-        x1_pos_t_1 = next_state['x1_pos_t_1']
-        x1_x_t_1 = next_state['x1_x_t_1']
-        x1_bond_edge_x_t_1 = next_state['x1_bond_edge_x_t_1']
-        x2_pos_t_1 = next_state['x2_pos_t_1']
-        x2_x_t_1 = next_state['x2_x_t_1']
-        x3_pos_t_1 = next_state['x3_pos_t_1']
-        x3_x_t_1 = next_state['x3_x_t_1']
-        x4_pos_t_1 = next_state['x4_pos_t_1']
-        x4_direction_t_1 = next_state['x4_direction_t_1']
-        x4_x_t_1 = next_state['x4_x_t_1']
-        
-        
-        # saving intermediate states for visualization / tracking
-        x1_t_x_list.append(x1_x_t.detach().cpu().numpy())
-        x1_t_bond_edge_x_list.append(x1_bond_edge_x_t.detach().cpu().numpy())
-        x1_t_pos_list.append(x1_pos_t.detach().cpu().numpy())
-        
-        x2_t_pos_list.append(x2_pos_t.detach().cpu().numpy())
-            
-        x3_t_pos_list.append(x3_pos_t.detach().cpu().numpy())
-        x3_t_x_list.append(x3_x_t.detach().cpu().numpy())
-        
-        x4_t_pos_list.append(x4_pos_t.detach().cpu().numpy())
-        x4_t_direction_list.append(x4_direction_t.detach().cpu().numpy())
-        x4_t_x_list.append(x4_x_t.detach().cpu().numpy())
-        
-        
-        # set next state and iterate
-        x1_pos_t = x1_pos_t_1
-        x1_x_t = x1_x_t_1
-        x1_bond_edge_x_t = x1_bond_edge_x_t_1
-        
-        x2_pos_t = x2_pos_t_1
-        x2_x_t = x2_x_t_1
-        
-        x3_pos_t = x3_pos_t_1
-        x3_x_t = x3_x_t_1
-        
-        x4_pos_t = x4_pos_t_1
-        x4_direction_t = x4_direction_t_1
-        x4_x_t = x4_x_t_1
-        
-        current_time_idx += 1 # Move to next index in time_steps sequence
-    
-        pbar.update(1)
-        
-        # this is necessary for clearing CUDA memory
-        del output_dict
-        del input_dict    
-        
+        # update states
+        x1_pos_t = next_state['x1_pos_t_1']
+        x1_x_t = next_state['x1_x_t_1']
+        x1_bond_edge_x_t = next_state['x1_bond_edge_x_t_1']
+        x2_pos_t = next_state['x2_pos_t_1']
+        x2_x_t = next_state['x2_x_t_1']
+        x3_pos_t = next_state['x3_pos_t_1']
+        x3_x_t = next_state['x3_x_t_1']
+        x4_pos_t = next_state['x4_pos_t_1']
+        x4_direction_t = next_state['x4_direction_t_1']
+        x4_x_t = next_state['x4_x_t_1']
+
     pbar.close()
-    
-    
-    
+ 
     ####### Extracting final structures, and re-scaling ########
     
     x2_pos_final = x2_pos_t[~virtual_node_mask_x2].numpy()

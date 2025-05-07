@@ -1,29 +1,39 @@
+"""
+Contains the process to perform one step of reverse denoising.
+"""
+from typing import Optional
+from tqdm import tqdm
 import torch
 import numpy as np
 import torch_scatter
 
+from .noise import (
+    _get_noise_params_for_timestep,
+    forward_jump
+)
 
 # helper function to perform one step of reverse denoising
 def _perform_reverse_denoising_step(
     current_t, # current timestep
     prev_t,    # previous timestep
-    batch_size, \
+    batch_size,
     noise_params_current, # dict of params for current_t
     noise_params_prev,    # dict of params for prev_t
     sampler_type,         # 'ddpm' or 'ddim'
     ddim_eta,             # DDIM eta parameter (0=deterministic)
     # current states (x_t)
-    x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, \
-    x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, \
-    x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, \
-    x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, \
+    x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1,
+    x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2,
+    x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3,
+    x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4,
     # model outputs (predicted noise eps_theta(x_t, t))
-    x1_pos_out, x1_x_out, x1_bond_edge_x_out,\
-    x2_pos_out, \
-    x3_pos_out, x3_x_out,\
-    x4_pos_out, x4_direction_out, x4_x_out,\
+    x1_pos_out, x1_x_out, x1_bond_edge_x_out,
+    x2_pos_out,
+    x3_pos_out, x3_x_out,
+    x4_pos_out, x4_direction_out, x4_x_out,
     # DDPM specific params
-    denoising_noise_scale, inject_noise_at_ts, inject_noise_scales):
+    denoising_noise_scale, inject_noise_at_ts, inject_noise_scales,
+    noise_dict: Optional[dict] = None):
 
     # extract parameters for convenience
     # current time
@@ -57,35 +67,52 @@ def _perform_reverse_denoising_step(
 
     # generate noise epsilon (used by DDPM and DDIM if eta > 0)
     # get added noise - x1
-    x1_pos_epsilon = torch.randn(x1_batch_size_nodes, 3)
+    if noise_dict is not None and 'x1' in noise_dict:
+        x1_pos_epsilon = noise_dict['x1']['pos_epsilon'] if 'pos_epsilon' in noise_dict['x1'] else torch.randn(x1_batch_size_nodes, 3)
+        x1_x_epsilon = noise_dict['x1']['x_epsilon'] if 'x_epsilon' in noise_dict['x1'] else torch.randn(x1_batch_size_nodes, num_atom_types)
+        x1_bond_edge_x_epsilon = noise_dict['x1']['bond_edge_x_epsilon'] if 'bond_edge_x_epsilon' in noise_dict['x1'] else torch.randn_like(x1_bond_edge_x_out)
+    else:
+        x1_pos_epsilon = torch.randn(x1_batch_size_nodes, 3)
+        x1_x_epsilon = torch.randn(x1_batch_size_nodes, num_atom_types)
+        x1_bond_edge_x_epsilon = torch.randn_like(x1_bond_edge_x_out)
     x1_pos_epsilon = x1_pos_epsilon - torch_scatter.scatter_mean(x1_pos_epsilon[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim=0)[x1_batch]
     x1_pos_epsilon[virtual_node_mask_x1, :] = 0.0
-    x1_x_epsilon = torch.randn(x1_batch_size_nodes, num_atom_types)
     x1_x_epsilon[virtual_node_mask_x1, :] = 0.0
-    x1_bond_edge_x_epsilon = torch.randn_like(x1_bond_edge_x_out)
     x1_c_t = (noise_params_current['x1']['sigma_t'] * noise_params_current['x1']['sigma_dash_t_1']) / (noise_params_current['x1']['sigma_dash_t'] + 1e-9) if noise_params_current['x1']['t_idx'] > 0 else 0
     x1_c_t = x1_c_t * denoising_noise_scale
 
     # get added noise - x2
-    x2_pos_epsilon = torch.randn(x2_batch_size_nodes, 3)
+    if noise_dict is not None and 'x2' in noise_dict:
+        x2_pos_epsilon = noise_dict['x2']['pos_epsilon'] if 'pos_epsilon' in noise_dict['x2'] else torch.randn(x2_batch_size_nodes, 3)
+    else:
+        x2_pos_epsilon = torch.randn(x2_batch_size_nodes, 3)
     x2_pos_epsilon[virtual_node_mask_x2, :] = 0.0
     x2_c_t = (noise_params_current['x2']['sigma_t'] * noise_params_current['x2']['sigma_dash_t_1']) / (noise_params_current['x2']['sigma_dash_t'] + 1e-9) if noise_params_current['x2']['t_idx'] > 0 else 0
     x2_c_t = x2_c_t * denoising_noise_scale
 
     # get added noise - x3
-    x3_pos_epsilon = torch.randn(x3_batch_size_nodes, 3)
+    if noise_dict is not None and 'x3' in noise_dict:
+        x3_pos_epsilon = noise_dict['x3']['pos_epsilon'] if 'pos_epsilon' in noise_dict['x3'] else torch.randn(x3_batch_size_nodes, 3)
+        x3_x_epsilon = noise_dict['x3']['x_epsilon'] if 'x_epsilon' in noise_dict['x3'] else torch.randn(x3_batch_size_nodes)
+    else:
+        x3_pos_epsilon = torch.randn(x3_batch_size_nodes, 3)
+        x3_x_epsilon = torch.randn(x3_batch_size_nodes)
     x3_pos_epsilon[virtual_node_mask_x3, :] = 0.0
-    x3_x_epsilon = torch.randn(x3_batch_size_nodes)
     x3_x_epsilon[virtual_node_mask_x3, ...] = 0.0
     x3_c_t = (noise_params_current['x3']['sigma_t'] * noise_params_current['x3']['sigma_dash_t_1']) / (noise_params_current['x3']['sigma_dash_t'] + 1e-9) if noise_params_current['x3']['t_idx'] > 0 else 0
     x3_c_t = x3_c_t * denoising_noise_scale
 
     # get added noise - x4
-    x4_pos_epsilon = torch.randn(x4_batch_size_nodes, 3)
+    if noise_dict is not None and 'x4' in noise_dict:
+        x4_pos_epsilon = noise_dict['x4']['pos_epsilon'] if 'pos_epsilon' in noise_dict['x4'] else torch.randn(x4_batch_size_nodes, 3)
+        x4_direction_epsilon = noise_dict['x4']['direction_epsilon'] if 'direction_epsilon' in noise_dict['x4'] else torch.randn(x4_batch_size_nodes, 3)
+        x4_x_epsilon = noise_dict['x4']['x_epsilon'] if 'x_epsilon' in noise_dict['x4'] else torch.randn(x4_batch_size_nodes, num_pharm_types)
+    else:
+        x4_pos_epsilon = torch.randn(x4_batch_size_nodes, 3)
+        x4_direction_epsilon = torch.randn(x4_batch_size_nodes, 3)
+        x4_x_epsilon = torch.randn(x4_batch_size_nodes, num_pharm_types)
     x4_pos_epsilon[virtual_node_mask_x4, :] = 0.0
-    x4_direction_epsilon = torch.randn(x4_batch_size_nodes, 3)
     x4_direction_epsilon[virtual_node_mask_x4, :] = 0.0
-    x4_x_epsilon = torch.randn(x4_batch_size_nodes, num_pharm_types)
     x4_x_epsilon[virtual_node_mask_x4, ...] = 0.0
     x4_c_t = (noise_params_current['x4']['sigma_t'] * noise_params_current['x4']['sigma_dash_t_1']) / (noise_params_current['x4']['sigma_dash_t'] + 1e-9) if noise_params_current['x4']['t_idx'] > 0 else 0
     x4_c_t = x4_c_t * denoising_noise_scale
@@ -330,6 +357,9 @@ def _perform_reverse_denoising_step(
     x4_direction_t_1[virtual_node_mask_x4] = x4_direction_t[virtual_node_mask_x4]
     x4_x_t_1[virtual_node_mask_x4] = x4_x_t[virtual_node_mask_x4]
 
+    if noise_dict is not None:
+        noise_dict = None
+
     return {
         'x1_pos_t_1': x1_pos_t_1, 'x1_x_t_1': x1_x_t_1, 'x1_bond_edge_x_t_1': x1_bond_edge_x_t_1,
         'x2_pos_t_1': x2_pos_t_1, 'x2_x_t_1': x2_x_t_1, 
@@ -415,3 +445,350 @@ def _prepare_model_input(device, dtype, batch_size, t,
     }
     return input_dict
 
+
+def _pack_inpainting_dict(
+    x2_pos_inpainting_trajectory, x3_pos_inpainting_trajectory, x3_x_inpainting_trajectory,
+    x4_pos_inpainting_trajectory, x4_direction_inpainting_trajectory, x4_x_inpainting_trajectory,
+    stop_inpainting_at_time_x2, stop_inpainting_at_time_x3, stop_inpainting_at_time_x4,
+    add_noise_to_inpainted_x2_pos, add_noise_to_inpainted_x3_pos, add_noise_to_inpainted_x3_x,
+    add_noise_to_inpainted_x4_pos, add_noise_to_inpainted_x4_direction, add_noise_to_inpainted_x4_type,
+    do_partial_inpainting
+):
+    return {
+        'x2_pos_inpainting_trajectory': x2_pos_inpainting_trajectory,
+        'x3_pos_inpainting_trajectory': x3_pos_inpainting_trajectory,
+        'x3_x_inpainting_trajectory': x3_x_inpainting_trajectory,
+        'x4_pos_inpainting_trajectory': x4_pos_inpainting_trajectory,
+        'x4_direction_inpainting_trajectory': x4_direction_inpainting_trajectory,
+        'x4_x_inpainting_trajectory': x4_x_inpainting_trajectory,
+        'stop_inpainting_at_time_x2': stop_inpainting_at_time_x2,
+        'stop_inpainting_at_time_x3': stop_inpainting_at_time_x3,
+        'stop_inpainting_at_time_x4': stop_inpainting_at_time_x4,
+        'add_noise_to_inpainted_x2_pos': add_noise_to_inpainted_x2_pos,
+        'add_noise_to_inpainted_x3_pos': add_noise_to_inpainted_x3_pos,
+        'add_noise_to_inpainted_x3_x': add_noise_to_inpainted_x3_x,
+        'add_noise_to_inpainted_x4_pos': add_noise_to_inpainted_x4_pos,
+        'add_noise_to_inpainted_x4_direction': add_noise_to_inpainted_x4_direction,
+        'add_noise_to_inpainted_x4_type': add_noise_to_inpainted_x4_type,
+        'do_partial_inpainting': do_partial_inpainting,
+    }
+
+
+def _inference_step(
+    model_pl, params,
+    # times
+    time_steps, current_time_idx,
+    harmonize, harmonize_ts, harmonize_jumps,
+    batch_size,
+    sampler_type, ddim_eta,
+    denoising_noise_scale, inject_noise_at_ts, inject_noise_scales,
+    # current states
+    x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, bond_edge_index_x1, virtual_node_mask_x1,
+    x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2,
+    x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3,
+    x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4,
+    # noise
+    noise_dict,
+    # inpainting
+    inpaint_x2_pos, inpaint_x3_pos, inpaint_x3_x, inpaint_x4_pos, inpaint_x4_direction, inpaint_x4_type,
+    inpainting_dict,
+    # progress bar
+    pbar: tqdm
+    ):
+    """
+    Inner loop for the denoising process.
+    This function is called by the main denoising function and handles the
+    denoising steps for each time step in the sequence.
+    """
+    current_t = time_steps[current_time_idx]
+    prev_t = time_steps[current_time_idx + 1] # The time we are calculating state FOR
+    
+    # t passed to helpers/model should be current time
+    t = current_t 
+
+    # inputs (these might be redundant now, t is the main driver)
+    x1_t = t
+    x2_t = t
+    x3_t = t
+    x4_t = t
+
+    if inpaint_x2_pos:
+        x2_pos_inpainting_trajectory = inpainting_dict['x2_pos_inpainting_trajectory']
+        stop_inpainting_at_time_x2 = inpainting_dict['stop_inpainting_at_time_x2']
+        add_noise_to_inpainted_x2_pos = inpainting_dict['add_noise_to_inpainted_x2_pos']
+    else:
+        stop_inpainting_at_time_x2 = 0.0
+    if inpaint_x3_pos:
+        x3_pos_inpainting_trajectory = inpainting_dict['x3_pos_inpainting_trajectory']
+    if inpaint_x3_x:
+        x3_x_inpainting_trajectory = inpainting_dict['x3_x_inpainting_trajectory']
+    if inpaint_x3_pos or inpaint_x3_x:
+        stop_inpainting_at_time_x3 = inpainting_dict['stop_inpainting_at_time_x3']
+        add_noise_to_inpainted_x3_pos = inpainting_dict['add_noise_to_inpainted_x3_pos']
+        add_noise_to_inpainted_x3_x = inpainting_dict['add_noise_to_inpainted_x3_x']
+    else:
+        stop_inpainting_at_time_x3 = 0.0
+    if inpaint_x4_pos:
+        x4_pos_inpainting_trajectory = inpainting_dict['x4_pos_inpainting_trajectory']
+    if inpaint_x4_direction:
+        x4_direction_inpainting_trajectory = inpainting_dict['x4_direction_inpainting_trajectory']
+    if inpaint_x4_type:
+        x4_x_inpainting_trajectory = inpainting_dict['x4_x_inpainting_trajectory']
+    if inpaint_x4_pos or inpaint_x4_direction or inpaint_x4_type:
+        stop_inpainting_at_time_x4 = inpainting_dict['stop_inpainting_at_time_x4']
+        add_noise_to_inpainted_x4_pos = inpainting_dict['add_noise_to_inpainted_x4_pos']
+        add_noise_to_inpainted_x4_direction = inpainting_dict['add_noise_to_inpainted_x4_direction']
+        add_noise_to_inpainted_x4_type = inpainting_dict['add_noise_to_inpainted_x4_type']
+    else:
+        stop_inpainting_at_time_x4 = 0.0
+    do_partial_inpainting = inpainting_dict['do_partial_inpainting']
+    
+    # harmonize
+    # harmonization needs careful consideration with subsequenced timesteps
+    # for now, we only harmonize if t is exactly in harmonize_ts
+    # a jump might skip over a harmonize_ts value in DDIM
+    # if harmonization is used with DDIM, ensure harmonize_ts align with time_steps
+    perform_harmonization_jump = False
+    harmonize_jump_len = 0
+    if (harmonize) and (len(harmonize_ts) > 0) and (t == harmonize_ts[0]):
+        print(f'Harmonizing... at time {t}')
+        harmonize_ts.pop(0)
+        if len(harmonize_ts) == 0:
+            harmonize = False # use up harmonization steps
+        harmonize_jump_len = harmonize_jumps.pop(0)
+        perform_harmonization_jump = True
+        
+    if perform_harmonization_jump:
+        x1_sigma_ts = params['noise_schedules']['x1']['sigma_ts']
+        x2_sigma_ts = params['noise_schedules']['x2']['sigma_ts']
+        x3_sigma_ts = params['noise_schedules']['x3']['sigma_ts']
+        x4_sigma_ts = params['noise_schedules']['x4']['sigma_ts']
+        
+        x1_pos_t, x1_t_jump = forward_jump(x1_pos_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = True, batch = x1_batch, mask = ~virtual_node_mask_x1)
+        x1_x_t, x1_t_jump = forward_jump(x1_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = x1_batch, mask = ~virtual_node_mask_x1)
+        x1_bond_edge_x_t, x1_t_jump = forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump_len, x1_sigma_ts, remove_COM_from_noise = False, batch = None, mask = None)
+        
+        x2_pos_t, x2_t_jump = forward_jump(x2_pos_t, x2_t, harmonize_jump_len, x2_sigma_ts, remove_COM_from_noise = False, batch = x2_batch, mask = ~virtual_node_mask_x2)
+        
+        x3_pos_t, x3_t_jump = forward_jump(x3_pos_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
+        x3_x_t, x3_t_jump = forward_jump(x3_x_t, x3_t, harmonize_jump_len, x3_sigma_ts, remove_COM_from_noise = False, batch = x3_batch, mask = ~virtual_node_mask_x3)
+        
+        x4_pos_t, x4_t_jump = forward_jump(x4_pos_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+        x4_direction_t, x4_t_jump = forward_jump(x4_direction_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+        x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump_len, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+
+        # after jumping forward, we need to find the corresponding index in our time_steps
+        # this simple implementation assumes the jump lands exactly on a future step in the sequence
+        # more robust: find the closest step in the sequence
+        jumped_to_t = x1_t_jump # assuming all jumps are same length
+        try:
+            # find where the jumped-to time occurs in the sequence
+            jump_to_idx = np.where(time_steps == jumped_to_t)[0][0]
+            # reset the loop index to continue from the jumped-to time
+            current_time_idx = jump_to_idx
+            pbar.update(harmonize_jump_len) # update progress bar for the jumped steps
+            print(f"Harmonization jumped from t={t} to t={jumped_to_t}, resuming loop.")
+            t = jumped_to_t # update t for the next iteration start
+            # need to re-fetch noise params for the new 't' before proceeding if the loop continued immediately,
+            # but we will recalculate at the start of the next iteration anyway
+            next_state = {
+                'x1_pos_t_1': x1_pos_t, 'x1_x_t_1': x1_x_t, 'x1_bond_edge_x_t_1': x1_bond_edge_x_t,
+                'x2_pos_t_1': x2_pos_t, 'x2_x_t_1': x2_x_t, 
+                'x3_pos_t_1': x3_pos_t, 'x3_x_t_1': x3_x_t,
+                'x4_pos_t_1': x4_pos_t, 'x4_direction_t_1': x4_direction_t, 'x4_x_t_1': x4_x_t,
+            }
+            return current_time_idx, next_state # skip the rest of the current loop iteration (denoising step)
+        except IndexError:
+                print(f"Warning: Harmonization jumped from t={t} to t={jumped_to_t}, which is not in the planned time_steps sequence {time_steps}. Stopping Harmonization.")
+                harmonize = False # disable future harmonization if jump is incompatible
+                # continue the loop from the *next* scheduled step after the original t
+
+    # inpainting logic
+    if (x2_t > stop_inpainting_at_time_x2) and inpaint_x2_pos:
+        x2_pos_t = torch.cat([x2_pos_inpainting_trajectory[x2_t] for _ in range(batch_size)], dim = 0)        
+        noise = torch.randn_like(x2_pos_t)
+        noise[virtual_node_mask_x2] = 0.0
+        x2_pos_t = x2_pos_t + add_noise_to_inpainted_x2_pos * noise
+    
+    if (x3_t > stop_inpainting_at_time_x3):
+        if inpaint_x3_pos:
+            x3_pos_t = torch.cat([x3_pos_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)        
+            noise = torch.randn_like(x3_pos_t)
+            noise[virtual_node_mask_x3] = 0.0
+            x3_pos_t = x3_pos_t + add_noise_to_inpainted_x3_pos * noise
+        if inpaint_x3_x:
+            x3_x_t = torch.cat([x3_x_inpainting_trajectory[x3_t] for _ in range(batch_size)], dim = 0)
+            noise = torch.randn_like(x3_x_t)
+            noise[virtual_node_mask_x3] = 0.0
+            x3_x_t = x3_x_t + add_noise_to_inpainted_x3_x * noise
+    
+    if (x4_t > stop_inpainting_at_time_x4):
+        if inpaint_x4_pos:
+            x4_pos_t_inpaint = torch.cat([x4_pos_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
+            noise = torch.randn_like(x4_pos_t)
+            noise[virtual_node_mask_x4] = 0.0
+            if do_partial_inpainting:
+                x4_pos_t_inpaint = x4_pos_t_inpaint.reshape(batch_size, -1, 3)
+                noise = noise.reshape(batch_size, -1, 3)[:, :x4_pos_t_inpaint.shape[1]]
+
+                x4_pos_t_inpaint = x4_pos_t_inpaint + add_noise_to_inpainted_x4_pos * noise
+                x4_pos_t = x4_pos_t.reshape(batch_size, -1, 3)
+                x4_pos_t[:, :x4_pos_t_inpaint.shape[1]] = x4_pos_t_inpaint
+                x4_pos_t = x4_pos_t.reshape(-1, 3)
+            else:
+                x4_pos_t_inpaint = x4_pos_t_inpaint + add_noise_to_inpainted_x4_pos * noise
+                x4_pos_t = x4_pos_t_inpaint
+
+        if inpaint_x4_direction:
+            x4_direction_t_inpaint = torch.cat([x4_direction_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
+            noise = torch.randn_like(x4_direction_t)
+            noise[virtual_node_mask_x4] = 0.0
+            if do_partial_inpainting:
+                x4_direction_t_inpaint = x4_direction_t_inpaint.reshape(batch_size, -1, 3)
+                noise = noise.reshape(batch_size, -1, 3)[:, :x4_direction_t_inpaint.shape[1]]
+
+                x4_direction_t_inpaint = x4_direction_t_inpaint + add_noise_to_inpainted_x4_direction * noise
+                x4_direction_t = x4_direction_t.reshape(batch_size, -1, 3)
+                x4_direction_t[:, :x4_direction_t_inpaint.shape[1]] = x4_direction_t_inpaint
+                x4_direction_t = x4_direction_t.reshape(-1, 3)
+            else:
+                x4_direction_t_inpaint = x4_direction_t_inpaint + add_noise_to_inpainted_x4_direction * noise
+                x4_direction_t = x4_direction_t_inpaint
+        if inpaint_x4_type:
+            num_pharm_types = params['dataset']['x4']['max_node_types']
+            x4_x_t_inpaint = torch.cat([x4_x_inpainting_trajectory[x4_t] for _ in range(batch_size)], dim = 0)
+            noise = torch.randn_like(x4_x_t)
+            noise[virtual_node_mask_x4] = 0.0
+            if do_partial_inpainting:
+                x4_x_t_inpaint = x4_x_t_inpaint.reshape(batch_size, -1, num_pharm_types)
+                noise = noise.reshape(batch_size, -1, num_pharm_types)[:, :x4_x_t_inpaint.shape[1]]
+
+                x4_x_t_inpaint = x4_x_t_inpaint + add_noise_to_inpainted_x4_type * noise
+                x4_x_t = x4_x_t.reshape(batch_size, -1, num_pharm_types)
+                x4_x_t[:, :x4_x_t_inpaint.shape[1]] = x4_x_t_inpaint
+                x4_x_t = x4_x_t.reshape(-1, num_pharm_types)
+            else:
+                x4_x_t_inpaint = x4_x_t_inpaint + add_noise_to_inpainted_x4_type * noise
+                x4_x_t = x4_x_t_inpaint
+
+
+    # get noise parameters for current timestep t and previous timestep prev_t
+    noise_params_current = _get_noise_params_for_timestep(params, current_t)
+    noise_params_prev = _get_noise_params_for_timestep(params, prev_t) # Need params for interval end
+
+    # pass only current params to model input preparation
+    x1_params_current = noise_params_current['x1']
+    x2_params_current = noise_params_current['x2']
+    x3_params_current = noise_params_current['x3']
+    x4_params_current = noise_params_current['x4']
+
+    # get current data
+    input_dict = _prepare_model_input(
+        model_pl.model.device, torch.float32, batch_size, current_t,
+        x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params_current,
+        x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params_current,
+        x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params_current,
+        x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params_current
+    )
+
+    # predict noise with neural network    
+    with torch.no_grad():
+        _, output_dict = model_pl.model.forward(input_dict)
+    
+    x1_x_out = output_dict['x1']['decoder']['denoiser']['x_out'].detach().cpu()
+    x1_bond_edge_x_out = output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'].detach().cpu()
+    x1_pos_out = output_dict['x1']['decoder']['denoiser']['pos_out'].detach().cpu()
+    x1_pos_out = x1_pos_out - torch_scatter.scatter_mean(x1_pos_out[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim = 0)[x1_batch] # removing COM from predicted noise 
+    
+    x1_x_out[virtual_node_mask_x1, :] = 0.0
+    x1_pos_out[virtual_node_mask_x1, :] = 0.0
+    
+    
+    x2_pos_out = output_dict['x2']['decoder']['denoiser']['pos_out']
+    if x2_pos_out is not None:
+        x2_pos_out = x2_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x3
+        x2_pos_out[virtual_node_mask_x2, :] = 0.0
+    else:
+        x2_pos_out = torch.zeros_like(x2_pos_t)
+        
+    
+    x3_pos_out = output_dict['x3']['decoder']['denoiser']['pos_out']
+    x3_x_out = output_dict['x3']['decoder']['denoiser']['x_out']
+    if x3_pos_out is not None:
+        x3_pos_out = x3_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x3
+        x3_pos_out[virtual_node_mask_x3, :] = 0.0
+        
+        x3_x_out = x3_x_out.detach().cpu()
+        x3_x_out = x3_x_out.squeeze()
+        x3_x_out[virtual_node_mask_x3] = 0.0
+    else:
+        x3_pos_out = torch.zeros_like(x3_pos_t)
+        x3_x_out = torch.zeros_like(x3_x_t)
+    
+    
+    x4_x_out = output_dict['x4']['decoder']['denoiser']['x_out']
+    x4_pos_out = output_dict['x4']['decoder']['denoiser']['pos_out']
+    x4_direction_out = output_dict['x4']['decoder']['denoiser']['direction_out']
+    if x4_x_out is not None:
+        x4_pos_out = x4_pos_out.detach().cpu() # NOT removing COM from predicted positional noise for x4
+        x4_pos_out[virtual_node_mask_x4, :] = 0.0
+        
+        x4_direction_out = x4_direction_out.detach().cpu() # NOT removing COM from predicted positional noise for x4
+        x4_direction_out[virtual_node_mask_x4, :] = 0.0
+        
+        x4_x_out = x4_x_out.detach().cpu()
+        x4_x_out = x4_x_out.squeeze()
+        x4_x_out[virtual_node_mask_x4] = 0.0
+    
+    else:
+        x4_pos_out = torch.zeros_like(x4_pos_t)
+        x4_direction_out = torch.zeros_like(x4_direction_t)
+        x4_x_out = torch.zeros_like(x4_x_t)
+    
+    # Perform reverse denoising step using helper function
+    next_state = _perform_reverse_denoising_step(
+        current_t, # Pass current time t (tau_i)
+        prev_t,    # Pass previous time t-1 (tau_{i-1})
+        batch_size, 
+        noise_params_current, # Pass params for current time t
+        noise_params_prev,   # Pass params for previous time t-1
+        sampler_type,        # Pass sampler type
+        ddim_eta,            # Pass eta
+        # Current states (x_t)
+        x1_pos_t, x1_x_t, x1_bond_edge_x_t, x1_batch, virtual_node_mask_x1, 
+        x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, 
+        x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, 
+        x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, 
+        # Model outputs (predicted noise or x0)
+        x1_pos_out, x1_x_out, x1_bond_edge_x_out,
+        x2_pos_out, 
+        x3_pos_out, x3_x_out,
+        x4_pos_out, x4_direction_out, x4_x_out,
+        # DDPM specific params (used conditionally within the step func)
+        denoising_noise_scale, inject_noise_at_ts, inject_noise_scales,
+        noise_dict=noise_dict
+    )
+
+    # if save_intermediate:
+    #     # saving intermediate states for visualization / tracking
+    #     x1_t_x_list.append(x1_x_t.detach().cpu().numpy())
+    #     x1_t_bond_edge_x_list.append(x1_bond_edge_x_t.detach().cpu().numpy())
+    #     x1_t_pos_list.append(x1_pos_t.detach().cpu().numpy())
+        
+    #     x2_t_pos_list.append(x2_pos_t.detach().cpu().numpy())
+            
+    #     x3_t_pos_list.append(x3_pos_t.detach().cpu().numpy())
+    #     x3_t_x_list.append(x3_x_t.detach().cpu().numpy())
+        
+    #     x4_t_pos_list.append(x4_pos_t.detach().cpu().numpy())
+    #     x4_t_direction_list.append(x4_direction_t.detach().cpu().numpy())
+    #     x4_t_x_list.append(x4_x_t.detach().cpu().numpy())
+
+    pbar.update(1)
+
+    del output_dict
+    del input_dict
+
+    current_time_idx += 1 # Move to next index in time_steps sequence
+
+    return current_time_idx, next_state # next_state is a dictionary with updated states
