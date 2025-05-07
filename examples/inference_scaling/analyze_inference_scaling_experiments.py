@@ -216,7 +216,7 @@ def plot_score_comparison(experiments, results_dict, output_dir):
     print(f"Score comparison plot saved to {output_dir}/score_comparison.png")
     
     # create a plot highlighting improvement over baseline
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 6))
     improvements = []
     labels = []
     
@@ -239,16 +239,32 @@ def plot_score_comparison(experiments, results_dict, output_dir):
         
         labels.append(label)
     
-    # plot bar chart
-    plt.bar(labels, improvements)
+    # plot bar chart with wider bars and more space
+    x_pos = np.arange(len(labels))
+    bar_width = 0.6
+    plt.figure(figsize=(max(12, len(labels)*1.5), 6))
+    
+    bars = plt.bar(x_pos, improvements, width=bar_width)
     plt.axhline(y=0, color='k', linestyle='-', alpha=0.3)
     plt.ylabel('Score Improvement over Baseline')
     plt.title('Comparison of Search Algorithm Improvements')
     plt.grid(axis='y', alpha=0.3)
     
+    plt.xticks(x_pos, labels)
+    if len(labels) > 6:
+        plt.xticks(rotation=45, ha='right')
+    
     # add value labels on top of bars
-    for i, v in enumerate(improvements):
-        plt.text(i, v + 0.01, f"{v:.4f}", ha='center')
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width()/2.,
+            height + 0.001,  # Small offset above bar
+            f"{improvements[i]:.4f}",
+            ha='center',
+            va='bottom',
+            fontsize=9
+        )
     
     plt.tight_layout()
     plt.savefig(output_dir / "improvement_comparison.png")
@@ -306,13 +322,26 @@ def plot_nfe_comparisons(experiments, results_dict, output_dir):
         
         improvement = results.get('best_score', 0) - results.get('baseline_score', 0)
         
+        # extract algorithm-specific parameters for annotations
+        config = results.get('config', {})
+        params = ""
+        algorithm = results.get('algorithm', 'unknown')
+        if algorithm == 'random':
+            params = f"trials={config.get('num_trials', '?')}"
+        elif algorithm == 'zero_order':
+            params = f"steps={config.get('num_steps', '?')}, n={config.get('num_neighbors', '?')}"
+        elif algorithm == 'guided':
+            params = f"pop={config.get('pop_size', '?')}, gen={config.get('num_generations', '?')}"
+        
         plot_data.append({
             'experiment': exp_name,
-            'algorithm': results.get('algorithm', 'unknown'),
+            'algorithm': algorithm,
+            'params': params,
             'nfe': results['nfe'],
             'best_combined': results.get('best_score'),
             'best_sa': results.get('best_sa_score'),
             'best_clogp': results.get('best_clogp_score'),
+            'best_qed': results.get('best_qed_score'),  # Include QED if available
             'improvement': improvement
         })
         
@@ -325,13 +354,23 @@ def plot_nfe_comparisons(experiments, results_dict, output_dir):
     # define metrics to plot against NFE
     metrics = {
         'best_combined': 'Best Combined Score',
-        'best_sa': 'Best SA Score',
-        'best_clogp': 'Best cLogP Score',
         'improvement': 'Score Improvement over Baseline'
     }
     
+    # add individual metrics if they exist in the data
+    if 'best_sa' in df_plot.columns and not df_plot['best_sa'].isnull().all():
+        metrics['best_sa'] = 'Best SA Score'
+    if 'best_clogp' in df_plot.columns and not df_plot['best_clogp'].isnull().all():
+        metrics['best_clogp'] = 'Best cLogP Score'
+    if 'best_qed' in df_plot.columns and not df_plot['best_qed'].isnull().all():
+        metrics['best_qed'] = 'Best QED Score'
+    
     # create plots
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    num_metrics = len(metrics)
+    rows = (num_metrics + 1) // 2 
+    fig, axes = plt.subplots(rows, 2, figsize=(16, 6*rows))
+    if rows == 1:
+        axes = np.array([axes])
     axes = axes.flatten()
     
     algo_styles = {
@@ -342,6 +381,10 @@ def plot_nfe_comparisons(experiments, results_dict, output_dir):
     }
 
     for i, (metric_key, metric_label) in enumerate(metrics.items()):
+        if i >= len(axes):
+            logging.warning(f"Not enough axes for plotting {metric_label}. Skipping.")
+            continue
+            
         ax = axes[i]
         if metric_key not in df_plot.columns or df_plot[metric_key].isnull().all():
             logging.warning(f"Skipping plot for {metric_label} due to missing data.")
@@ -353,24 +396,89 @@ def plot_nfe_comparisons(experiments, results_dict, output_dir):
         for algo in df_plot['algorithm'].unique():
             df_algo = df_plot[df_plot['algorithm'] == algo]
             style = algo_styles.get(algo, algo_styles['unknown'])
-            ax.scatter(df_algo['nfe'], df_algo[metric_key],
+            scatter = ax.scatter(df_algo['nfe'], df_algo[metric_key],
                        label=algo, marker=style['marker'], color=style['color'], 
-                       alpha=0.8, s=50)
+                       alpha=0.8, s=80)
+            
+            # Add annotations for each point
+            for _, row in df_algo.iterrows():
+                ax.annotate(
+                    row['params'],
+                    xy=(row['nfe'], row[metric_key]),
+                    xytext=(5, 5),
+                    textcoords='offset points',
+                    fontsize=8,
+                    alpha=0.7
+                )
         
         ax.set_title(f'{metric_label} vs. NFE')
         ax.set_xlabel('Number of Function Evaluations (NFE)')
         ax.set_ylabel(metric_label)
         ax.grid(True, alpha=0.4)
         ax.legend(title="Algorithm")
-        # ax.set_xscale('log') 
+        
+        # add best fit line if there are enough points per algorithm
+        # for algo in df_plot['algorithm'].unique():
+        #     df_algo = df_plot[df_plot['algorithm'] == algo]
+        #     if len(df_algo) >= 3:  # Only add trend line if we have at least 3 points
+        #         try:
+        #             x = df_algo['nfe'].values
+        #             y = df_algo[metric_key].values
+        #             z = np.polyfit(x, y, 1)
+        #             p = np.poly1d(z)
+        #             x_sorted = np.sort(x)
+        #             style = algo_styles.get(algo, algo_styles['unknown'])
+        #             ax.plot(x_sorted, p(x_sorted), '--', color=style['color'], alpha=0.5)
+        #         except Exception as e:
+        #             logging.warning(f"Could not add trend line for {algo}: {e}")
+
+    # Remove unused subplots if any
+    for j in range(i+1, len(axes)):
+        fig.delaxes(axes[j])
 
     plt.tight_layout()
-    # plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    # fig.suptitle('Performance vs. Computational Cost (NFE)', fontsize=16, y=0.99)
     plot_path = output_dir / "performance_vs_nfe.png"
     plt.savefig(plot_path)
     plt.close(fig)
-    logging.info(f"Saved Performance vs. NFE comparison plot to {plot_path}")
+    
+    # Create a separate plot showing NFE efficiency
+    plt.figure(figsize=(10, 6))
+    
+    # Calculate efficiency (improvement per NFE)
+    df_plot['efficiency'] = df_plot['improvement'] / df_plot['nfe']
+    
+    # Sort by efficiency
+    df_plot = df_plot.sort_values('efficiency', ascending=False)
+    
+    # Create bar chart of efficiency
+    bars = plt.bar(range(len(df_plot)), df_plot['efficiency'], color=[algo_styles.get(algo, algo_styles['unknown'])['color'] for algo in df_plot['algorithm']])
+    
+    # Add labels
+    plt.xlabel('Experiment')
+    plt.ylabel('Improvement per NFE')
+    plt.title('Efficiency of Different Search Strategies')
+    
+    # Add x-tick labels with algorithm and params
+    plt.xticks(range(len(df_plot)), [f"{row['algorithm']}\n{row['params']}" for _, row in df_plot.iterrows()], rotation=45, ha='right')
+    
+    # Add value labels on bars
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width()/2.,
+            height + 0.0001,
+            f"{height:.5f}",
+            ha='center',
+            va='bottom',
+            fontsize=8
+        )
+    
+    plt.tight_layout()
+    efficiency_path = output_dir / "nfe_efficiency.png"
+    plt.savefig(efficiency_path)
+    plt.close()
+    
+    logging.info(f"Saved Performance vs. NFE comparison plots to {output_dir}")
 
 
 def analyze_experiments(args):
