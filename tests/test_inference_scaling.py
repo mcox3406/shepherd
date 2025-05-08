@@ -177,15 +177,15 @@ def test_clogp_verifier(mock_preprocess, mock_sample, mock_mol):
     mock_preprocess.return_value = mock_mol
     
     # test with a value in the middle of the range
-    with patch('rdkit.Chem.Crippen.MolLogP', return_value=1.5):
-        verifier = CLogPVerifier()  # default range is (-1, 4)
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=7.0):
+        verifier = CLogPVerifier()  # default range is (-1, 15)
         
         score = verifier(mock_sample)
         
         mock_preprocess.assert_called_once_with(mock_sample)
         
         # check that the score is as expected
-        # For logP=1.5 with range (-1, 4), expected score is (1.5 - (-1))/(4-(-1)) = 2.5/5 = 0.5
+        # For logP=7.0 with range (-1, 15), expected score is (7.0 - (-1))/(15-(-1)) = 8/16 = 0.5
         assert score == 0.5
     
     # reset the mock
@@ -201,7 +201,7 @@ def test_clogp_verifier(mock_preprocess, mock_sample, mock_mol):
     mock_preprocess.reset_mock()
     
     # test with a value at upper bound
-    with patch('rdkit.Chem.Crippen.MolLogP', return_value=4.0):
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=15.0):
         verifier = CLogPVerifier()
         score = verifier(mock_sample)
         assert score == 1.0  # upper bound should map to 1.0
@@ -219,7 +219,7 @@ def test_clogp_verifier(mock_preprocess, mock_sample, mock_mol):
     mock_preprocess.reset_mock()
     
     # test with a value outside the range (upper)
-    with patch('rdkit.Chem.Crippen.MolLogP', return_value=5.0):
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=16.0):
         verifier = CLogPVerifier()
         score = verifier(mock_sample)
         assert score == 1.0  # above upper bound should be clamped to 1.0

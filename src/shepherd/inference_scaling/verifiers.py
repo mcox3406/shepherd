@@ -148,14 +148,14 @@ class SAScoreVerifier(Verifier):
 class CLogPVerifier(Verifier):
     """Verifier for calculated LogP values in a druglike range."""
     
-    def __init__(self, weight=1.0, target_range=(-1.0, 4.0)):
+    def __init__(self, weight=1.0, target_range=(-1.0, 15.0)):
         """
         Initialize the cLogP verifier.
         
         Args:
             weight (float): Weight of the verifier in multi-objective optimization.
             target_range (tuple): The range for cLogP values to be scaled from.
-                                  Default is (-1.0, 4.0) for typical drug-like molecules.
+                                  Default is (-1.0, 15.0) for molecules with wide range of hydrophobicity.
         """
         super().__init__("cLogP", weight)
         self.target_range = target_range

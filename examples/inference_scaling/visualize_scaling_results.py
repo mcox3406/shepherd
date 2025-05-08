@@ -259,6 +259,29 @@ def plot_chemical_diversity(df, output_dir):
     plt.close(fig)
     logging.info(f"Saved Tanimoto similarity plot to {plot_path}")
 
+def rescale_properties(df):
+    """
+    Rescale normalized property scores back to their original scales for better interpretation.
+    
+    Args:
+        df: DataFrame with normalized property scores
+        
+    Returns:
+        DataFrame with additional columns containing rescaled properties
+    """
+    df_rescaled = df.copy()
+    
+    # SA score rescaling (from [0,1] to original [1,10] where 1 is easy, 10 is hard)
+    if 'sa_score' in df.columns:
+        df_rescaled['sa_score_orig'] = 1 + 9 * (1 - df['sa_score'])
+    
+    # cLogP rescaling (from [0,1] to original [-1,15] range)
+    if 'clogp_score' in df.columns:
+        df_rescaled['clogp_orig'] = df['clogp_score'] * 16 - 1  # maps 0->-1, 1->15
+    
+    # QED is already in [0,1] so no rescaling needed
+    
+    return df_rescaled
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize detailed ShEPhERD inference scaling results.')

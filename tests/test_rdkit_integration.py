@@ -248,11 +248,11 @@ def test_clogp_with_explicit_mol():
     verifier = CLogPVerifier()
     
     # Patch Crippen.MolLogP to return a known value for testing
-    with patch('rdkit.Chem.Crippen.MolLogP', return_value=1.5):
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=7.0):
         score = verifier(mol)
         
         assert score is not None, "Failed to calculate cLogP score"
-        # For logP=1.5 with range (-1, 4), expected score is (1.5 - (-1))/(4-(-1)) = 2.5/5 = 0.5
+        # For logP=7.0 with range (-1, 15), expected score is (7.0 - (-1))/(15-(-1)) = 8/16 = 0.5
         assert pytest.approx(score, abs=1e-5) == 0.5
         assert 0.0 <= score <= 1.0, "cLogP score should be in [0,1]"
     
@@ -302,22 +302,22 @@ def test_clogp_verifier(sample_methanol, patched_verifier, monkeypatch):
         monkeypatch.setattr(verifier, "preprocess", preprocess_test_sample)
         
         # patch Crippen.MolLogP to return a known value for testing
-        with patch('rdkit.Chem.Crippen.MolLogP', return_value=1.5):
+        with patch('rdkit.Chem.Crippen.MolLogP', return_value=7.0):
             score = verifier(sample_methanol)
             
             assert score is not None, "Failed to calculate cLogP score"
-            # For logP=1.5 with range (-1, 4), expected score is (1.5 - (-1))/(4-(-1)) = 2.5/5 = 0.5
+            # For logP=7.0 with range (-1, 15), expected score is (7.0 - (-1))/(15-(-1)) = 8/16 = 0.5
             assert pytest.approx(score, abs=1e-5) == 0.5
             assert 0.0 <= score <= 1.0, "cLogP score should be in [0,1]"
         
         # test other values
         for logp_value, expected_score in [
             (-1.0, 0.0),     # lower bound
-            (4.0, 1.0),      # upper bound
+            (15.0, 1.0),     # upper bound
             (-2.0, 0.0),     # below lower bound, clamped
-            (5.0, 1.0),      # above upper bound, clamped
-            (0.0, 0.2),      # 20% of the way from -1 to 4
-            (2.5, 0.7)       # 70% of the way from -1 to 4
+            (16.0, 1.0),     # above upper bound, clamped
+            (0.0, 0.0625),   # 6.25% of the way from -1 to 15
+            (7.0, 0.5)       # 50% of the way from -1 to 15
         ]:
             with patch('rdkit.Chem.Crippen.MolLogP', return_value=logp_value):
                 score = verifier(sample_methanol)
