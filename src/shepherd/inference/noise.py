@@ -5,7 +5,8 @@ import torch_scatter
 
 # harmonization functions
 def forward_jump_parameters(t_start_idx, jump, sigma_ts):
-    t_end_idx = t_start_idx + jump
+    t_start_idx = int(t_start_idx)  # Convert to Python int
+    t_end_idx = int(t_start_idx + jump)  # Convert to Python int
     sigma_ts_ = sigma_ts[t_start_idx : t_end_idx] # std deviation schedule
     alpha_ts_ = (1. - sigma_ts_** 2.0)**0.5 # how much (mean) signal is preserved at each noising step
     alpha_dash_ts_ = np.cumprod(alpha_ts_)

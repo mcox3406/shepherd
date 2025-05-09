@@ -29,9 +29,22 @@ from shepherd.inference_scaling import (
     RandomSearch,
     ZeroOrderSearch,
     GuidedSearch,
+    SearchOverPaths,
     create_rdkit_molecule,
     get_xyz_content
 )
+
+
+# Custom JSON encoder to handle numpy types
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
 
 def parse_args():
@@ -40,8 +53,8 @@ def parse_args():
     # required arguments
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--algorithm', type=str, required=True, choices=['random', 'zero_order', 'guided'],
-                        help='Search algorithm to use (random, zero_order, guided)')
+    parser.add_argument('--algorithm', type=str, required=True, choices=['random', 'zero_order', 'guided', 'search_over_paths'],
+                        help='Search algorithm to use (random, zero_order, guided, search_over_paths)')
     
     # model configuration
     parser.add_argument('--device', type=str, default=None,
@@ -101,6 +114,18 @@ def parse_args():
     parser.add_argument('--ddim_eta', type=float, default=0.0,
                         help='Eta parameter for DDIM sampling (0.0 for deterministic)')
     
+    # search over paths parameters
+    parser.add_argument('--num_paths_N', type=int, default=10,
+                        help='Number of paths to search over')
+    parser.add_argument('--path_width_M', type=int, default=5,
+                        help='Number of samples for each path')
+    parser.add_argument('--initial_t_idx', type=float, default=355,
+                        help='Initial time to denoise to')
+    parser.add_argument('--delta_f', type=float, default=312,
+                        help='Number of steps to forward noise')
+    parser.add_argument('--delta_b', type=float, default=324,
+                        help='Number of steps to reverse noise. Must be larger than delta_f.')
+    
     return parser.parse_args()
 
 
@@ -133,6 +158,8 @@ def generate_experiment_name(args):
         name_parts.append(f"{args.algorithm}_steps{args.num_steps}_nbrs{args.num_neighbors}_ss{args.step_size}")
     elif args.algorithm == 'guided':
         name_parts.append(f"{args.algorithm}_pop{args.pop_size}_gen{args.num_generations}_mut{args.mutation_rate}_elite{args.elite_fraction}")
+    elif args.algorithm == 'search_over_paths':
+        name_parts.append(f"{args.algorithm}_paths{args.num_paths}_len{args.path_length}_ss{args.path_step_size}")
     
     # add sampler info if not default DDPM
     if args.sampler_type != 'ddpm':
@@ -148,28 +175,49 @@ def generate_experiment_name(args):
 
 def save_results(results, output_path):
     """Save experiment results to the specified output path"""
-    output_path.mkdir(exist_ok=True, parents=True)
-    
-    # save all results in pickle format
-    with open(output_path / "results.pkl", 'wb') as f:
-        pickle.dump(results, f)
-    
-    # save summary and configuration as JSON
-    summary = {
-        'algorithm': results['algorithm'],
-        'best_score': results.get('best_score', 0),
-        'duration_seconds': results.get('duration_seconds', 0),
-        'num_evaluations': len(results.get('scores', [])),
-        'nfe': results.get('nfe', 0),
-        'best_sa_score': results.get('best_sa_score'),
-        'best_clogp_score': results.get('best_clogp_score'),
-        'config': results.get('config', {})
-    }
-    
-    with open(output_path / "summary.json", 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    print(f"Results saved to {output_path}")
+    try:
+        output_path = Path(output_path)
+        output_path.mkdir(exist_ok=True, parents=True)
+        
+        print(f"Saving results to: {output_path}")
+        
+        pickle_path = output_path / "results.pkl"
+        with open(pickle_path, 'wb') as f:
+            pickle.dump(results, f)
+        print(f"Full results saved to: {pickle_path}")
+        
+        # save summary and configuration as JSON
+        summary = {
+            'algorithm': results['algorithm'],
+            'best_score': results.get('best_score', 0),
+            'duration_seconds': results.get('duration_seconds', 0),
+            'num_evaluations': len(results.get('scores', [])),
+            'nfe': results.get('metadata', {}).get('nfe', 0),
+            'best_sa_score': results.get('best_sa_score'),
+            'best_clogp_score': results.get('best_clogp_score'),
+            'config': results.get('config', {}),
+            'best_smiles': results.get('best_smiles', ''),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Add SearchOverPaths specific fields if they exist
+        if 'metadata' in results and isinstance(results['metadata'], dict):
+            if 'best_final_score' in results['metadata']:
+                summary['best_final_score'] = results['metadata']['best_final_score']
+            if 'best_final_path_idx' in results['metadata']:
+                summary['best_final_path_idx'] = results['metadata']['best_final_path_idx']
+            if 'best_overall_path_idx' in results['metadata']:
+                summary['best_overall_path_idx'] = results['metadata']['best_overall_path_idx']
+        
+        summary_path = output_path / "summary.json"
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2, cls=NumpyEncoder)
+        print(f"Summary saved to: {summary_path}")
+        
+        return True
+    except Exception as e:
+        print(f"Error saving results: {e}")
+        return False
 
 
 def plot_results(results, output_path):
@@ -214,6 +262,8 @@ def run_experiment(args):
     output_path = Path(args.output_dir) / exp_name
     output_path.mkdir(exist_ok=True, parents=True)
     
+    print(f"Experiment output directory: {output_path}")
+    
     # create subdirectory for all molecules
     all_mols_dir = output_path / "all_molecules"
     all_mols_dir.mkdir(exist_ok=True)
@@ -229,7 +279,7 @@ def run_experiment(args):
     # save configuration
     config = vars(args)
     with open(output_path / "config.json", 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(config, f, indent=2, cls=NumpyEncoder)
     
     print(f"Running experiment: {exp_name}")
     print(f"Loading model from {args.checkpoint}")
@@ -379,6 +429,84 @@ def run_experiment(args):
                 callback=comprehensive_save_callback
             )
         
+        elif args.algorithm == 'search_over_paths':
+            print(f"Running Search Over Paths with {args.num_paths_N} paths and {args.path_width_M} samples per path")
+            search = SearchOverPaths(multi_verifier, model_runner)
+            
+            # Custom callback for SearchOverPaths that adapts to its different structure
+            def search_over_paths_callback(**kwargs):
+                try:
+                    sample = kwargs['best_structure_output']
+                    score = kwargs['best_score']
+                    algorithm = kwargs['algorithm']
+                    iteration = kwargs['iteration']
+                    sub_iteration = kwargs['sub_iteration']
+                    best_rdmol = kwargs.get('best_rdmol')
+                    scores = kwargs.get('scores', [])
+
+                    # 1. generate filename
+                    prefix = f"{algorithm}_i{iteration:04d}_s{sub_iteration:04d}"
+                    filename_xyz = f"{prefix}.xyz"
+                    filepath_xyz = all_mols_dir / filename_xyz
+
+                    # 2. generate and save xyz content
+                    xyz_content = get_xyz_content(sample)
+                    if xyz_content:
+                        with open(filepath_xyz, 'w') as f:
+                            f.write(xyz_content)
+                    else:
+                        filename_xyz = "error_generating_xyz"
+
+                    # 3. calculate individual properties and smiles
+                    sa_score = sa_verifier(sample)
+                    clogp_score = clogp_verifier(sample)
+                    smiles = "error_creating_mol"
+                    if best_rdmol:
+                        try:
+                            smiles = Chem.MolToSmiles(best_rdmol)
+                        except Exception as e:
+                            logging.debug(f"Could not get SMILES for {filename_xyz}: {e}")
+                            smiles = "error_generating_smiles"
+
+                    # 4. append to csv log
+                    log_row = [filename_xyz, algorithm, iteration, sub_iteration, False, False,
+                               smiles, sa_score, clogp_score, score]
+                    with open(all_mols_log_path, 'a', newline='') as csvfile:
+                        writer = csv.writer(csvfile)
+                        writer.writerow(log_row)
+
+                except Exception as e:
+                    logging.error(f"Error in search_over_paths_callback: {e}", exc_info=True)
+            
+            # run search
+            (best_final_score, best_overall_score, best_final_path_idx, best_overall_path_idx,
+             best_final_sample, best_overall_sample, best_final_rdmol, best_overall_rdmol,
+             top_N, all_scores_history, metadata) = search.search(
+                N_paths=args.num_paths_N,
+                M_expansion_per_path=args.path_width_M,
+                sigma_t_initial=args.initial_t_idx,
+                delta_f_steps=args.delta_f,
+                delta_b_steps=args.delta_b,
+                N_x1=args.n_atoms,
+                N_x4=args.n_pharm,
+                verbose=args.verbose,
+                device=str(device),
+                callback=search_over_paths_callback
+            )
+            
+            # Adapt the return values to match the expected format
+            best_sample = best_overall_sample  # Use the best overall sample
+            best_score = best_overall_score    # Use the best overall score
+            scores = [d['best_overall_score'] for d in list(top_N.values())]  # Use best scores from each path
+            
+            # Add additional metadata specific to SearchOverPaths
+            metadata.update({
+                'best_final_score': best_final_score,
+                'best_final_path_idx': best_final_path_idx,
+                'best_overall_path_idx': best_overall_path_idx,
+                'all_scores_history': all_scores_history
+            })
+        
         # calculate experiment duration
         end_time = time.time()
         duration = end_time - results['start_time']
@@ -406,7 +534,10 @@ def run_experiment(args):
         print("\nExperiment Summary:")
         print(f"Algorithm: {args.algorithm}")
         print(f"Best Score: {best_score:.4f}")
-        print(f"Improvement over Baseline: {best_score - baseline_score:.4f} ({(best_score - baseline_score) / baseline_score * 100:.2f}%)")
+        if baseline_score == 0:
+            print(f"Improvement over Baseline: {best_score - baseline_score:.4f} (N/A%)")
+        else:
+            print(f"Improvement over Baseline: {best_score - baseline_score:.4f} ({(best_score - baseline_score) / baseline_score * 100:.2f}%)")
         print(f"Duration: {duration:.2f} seconds")
 
         nfe = metadata.get('nfe', 0)
@@ -429,9 +560,16 @@ def run_experiment(args):
             'best_clogp_score': best_clogp_score
         })
 
-        save_results(results, output_path)
+        # Save results
+        print("\nSaving results...")
+        if save_results(results, output_path):
+            print("Results saved successfully")
+        else:
+            print("Warning: Failed to save some results")
         
+        # Generate plots if requested
         if args.plot:
+            print("\nGenerating plots...")
             plot_results(results, output_path)
         
         return results
@@ -460,4 +598,4 @@ def run_experiment(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_experiment(args) 
+    run_experiment(args)

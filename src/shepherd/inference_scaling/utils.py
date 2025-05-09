@@ -131,6 +131,10 @@ def create_rdkit_molecule(sample):
             logging.debug(f"Generated SMILES: {smiles}")
         except Exception as e:
             logging.warning(f"SMILES generation failed: {e}")
+
+        if '.' in smiles:
+            logging.warning("Molecule is a fragment, failed to create molecule")
+            return None
         
         return mol_final
         

@@ -14,6 +14,7 @@ from .search_algorithms import (
     RandomSearch,
     ZeroOrderSearch,
     GuidedSearch,
+    SearchOverPaths,
 )
 
 from .model_runner import ShepherdModelRunner

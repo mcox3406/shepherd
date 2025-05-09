@@ -365,6 +365,7 @@ def _perform_reverse_denoising_step(
         'x2_pos_t_1': x2_pos_t_1, 'x2_x_t_1': x2_x_t_1, 
         'x3_pos_t_1': x3_pos_t_1, 'x3_x_t_1': x3_x_t_1,
         'x4_pos_t_1': x4_pos_t_1, 'x4_direction_t_1': x4_direction_t_1, 'x4_x_t_1': x4_x_t_1,
+        'noise_dict': noise_dict
     }
 
 
@@ -491,9 +492,9 @@ def _inference_step(
     noise_dict,
     # inpainting
     inpaint_x2_pos, inpaint_x3_pos, inpaint_x3_x, inpaint_x4_pos, inpaint_x4_direction, inpaint_x4_type,
-    inpainting_dict,
+    inpainting_dict: Optional[dict] = None,
     # progress bar
-    pbar: tqdm
+    pbar: Optional[tqdm] = None
     ):
     """
     Inner loop for the denoising process.
@@ -512,36 +513,41 @@ def _inference_step(
     x3_t = t
     x4_t = t
 
-    if inpaint_x2_pos:
-        x2_pos_inpainting_trajectory = inpainting_dict['x2_pos_inpainting_trajectory']
-        stop_inpainting_at_time_x2 = inpainting_dict['stop_inpainting_at_time_x2']
-        add_noise_to_inpainted_x2_pos = inpainting_dict['add_noise_to_inpainted_x2_pos']
-    else:
-        stop_inpainting_at_time_x2 = 0.0
-    if inpaint_x3_pos:
-        x3_pos_inpainting_trajectory = inpainting_dict['x3_pos_inpainting_trajectory']
-    if inpaint_x3_x:
-        x3_x_inpainting_trajectory = inpainting_dict['x3_x_inpainting_trajectory']
-    if inpaint_x3_pos or inpaint_x3_x:
-        stop_inpainting_at_time_x3 = inpainting_dict['stop_inpainting_at_time_x3']
-        add_noise_to_inpainted_x3_pos = inpainting_dict['add_noise_to_inpainted_x3_pos']
-        add_noise_to_inpainted_x3_x = inpainting_dict['add_noise_to_inpainted_x3_x']
-    else:
-        stop_inpainting_at_time_x3 = 0.0
-    if inpaint_x4_pos:
-        x4_pos_inpainting_trajectory = inpainting_dict['x4_pos_inpainting_trajectory']
-    if inpaint_x4_direction:
-        x4_direction_inpainting_trajectory = inpainting_dict['x4_direction_inpainting_trajectory']
-    if inpaint_x4_type:
-        x4_x_inpainting_trajectory = inpainting_dict['x4_x_inpainting_trajectory']
-    if inpaint_x4_pos or inpaint_x4_direction or inpaint_x4_type:
-        stop_inpainting_at_time_x4 = inpainting_dict['stop_inpainting_at_time_x4']
-        add_noise_to_inpainted_x4_pos = inpainting_dict['add_noise_to_inpainted_x4_pos']
-        add_noise_to_inpainted_x4_direction = inpainting_dict['add_noise_to_inpainted_x4_direction']
-        add_noise_to_inpainted_x4_type = inpainting_dict['add_noise_to_inpainted_x4_type']
-    else:
-        stop_inpainting_at_time_x4 = 0.0
-    do_partial_inpainting = inpainting_dict['do_partial_inpainting']
+    stop_inpainting_at_time_x2 = 0.0
+    stop_inpainting_at_time_x3 = 0.0
+    stop_inpainting_at_time_x4 = 0.0
+
+    if inpainting_dict is not None:
+        if inpaint_x2_pos:
+            x2_pos_inpainting_trajectory = inpainting_dict['x2_pos_inpainting_trajectory']
+            stop_inpainting_at_time_x2 = inpainting_dict['stop_inpainting_at_time_x2']
+            add_noise_to_inpainted_x2_pos = inpainting_dict['add_noise_to_inpainted_x2_pos']
+        else:
+            stop_inpainting_at_time_x2 = 0.0
+        if inpaint_x3_pos:
+            x3_pos_inpainting_trajectory = inpainting_dict['x3_pos_inpainting_trajectory']
+        if inpaint_x3_x:
+            x3_x_inpainting_trajectory = inpainting_dict['x3_x_inpainting_trajectory']
+        if inpaint_x3_pos or inpaint_x3_x:
+            stop_inpainting_at_time_x3 = inpainting_dict['stop_inpainting_at_time_x3']
+            add_noise_to_inpainted_x3_pos = inpainting_dict['add_noise_to_inpainted_x3_pos']
+            add_noise_to_inpainted_x3_x = inpainting_dict['add_noise_to_inpainted_x3_x']
+        else:
+            stop_inpainting_at_time_x3 = 0.0
+        if inpaint_x4_pos:
+            x4_pos_inpainting_trajectory = inpainting_dict['x4_pos_inpainting_trajectory']
+        if inpaint_x4_direction:
+            x4_direction_inpainting_trajectory = inpainting_dict['x4_direction_inpainting_trajectory']
+        if inpaint_x4_type:
+            x4_x_inpainting_trajectory = inpainting_dict['x4_x_inpainting_trajectory']
+        if inpaint_x4_pos or inpaint_x4_direction or inpaint_x4_type:
+            stop_inpainting_at_time_x4 = inpainting_dict['stop_inpainting_at_time_x4']
+            add_noise_to_inpainted_x4_pos = inpainting_dict['add_noise_to_inpainted_x4_pos']
+            add_noise_to_inpainted_x4_direction = inpainting_dict['add_noise_to_inpainted_x4_direction']
+            add_noise_to_inpainted_x4_type = inpainting_dict['add_noise_to_inpainted_x4_type']
+        else:
+            stop_inpainting_at_time_x4 = 0.0
+        do_partial_inpainting = inpainting_dict['do_partial_inpainting']
     
     # harmonize
     # harmonization needs careful consideration with subsequenced timesteps
@@ -586,7 +592,8 @@ def _inference_step(
             jump_to_idx = np.where(time_steps == jumped_to_t)[0][0]
             # reset the loop index to continue from the jumped-to time
             current_time_idx = jump_to_idx
-            pbar.update(harmonize_jump_len) # update progress bar for the jumped steps
+            if pbar is not None:
+                pbar.update(harmonize_jump_len) # update progress bar for the jumped steps
             print(f"Harmonization jumped from t={t} to t={jumped_to_t}, resuming loop.")
             t = jumped_to_t # update t for the next iteration start
             # need to re-fetch noise params for the new 't' before proceeding if the loop continued immediately,
@@ -596,12 +603,13 @@ def _inference_step(
                 'x2_pos_t_1': x2_pos_t, 'x2_x_t_1': x2_x_t, 
                 'x3_pos_t_1': x3_pos_t, 'x3_x_t_1': x3_x_t,
                 'x4_pos_t_1': x4_pos_t, 'x4_direction_t_1': x4_direction_t, 'x4_x_t_1': x4_x_t,
+                'noise_dict': noise_dict
             }
             return current_time_idx, next_state # skip the rest of the current loop iteration (denoising step)
         except IndexError:
-                print(f"Warning: Harmonization jumped from t={t} to t={jumped_to_t}, which is not in the planned time_steps sequence {time_steps}. Stopping Harmonization.")
-                harmonize = False # disable future harmonization if jump is incompatible
-                # continue the loop from the *next* scheduled step after the original t
+            print(f"Warning: Harmonization jumped from t={t} to t={jumped_to_t}, which is not in the planned time_steps sequence {time_steps}. Stopping Harmonization.")
+            harmonize = False # disable future harmonization if jump is incompatible
+            # continue the loop from the *next* scheduled step after the original t
 
     # inpainting logic
     if (x2_t > stop_inpainting_at_time_x2) and inpaint_x2_pos:
@@ -784,7 +792,8 @@ def _inference_step(
     #     x4_t_direction_list.append(x4_direction_t.detach().cpu().numpy())
     #     x4_t_x_list.append(x4_x_t.detach().cpu().numpy())
 
-    pbar.update(1)
+    if pbar is not None:
+        pbar.update(1)
 
     del output_dict
     del input_dict
@@ -792,3 +801,66 @@ def _inference_step(
     current_time_idx += 1 # Move to next index in time_steps sequence
 
     return current_time_idx, next_state # next_state is a dictionary with updated states
+
+
+def _extract_generated_samples(
+        x1_x_t, x1_pos_t, x1_bond_edge_x_t, virtual_node_mask_x1,
+        x2_pos_t, virtual_node_mask_x2,
+        x3_pos_t, x3_x_t, virtual_node_mask_x3,
+        x4_pos_t, x4_direction_t, x4_x_t, virtual_node_mask_x4,
+        params, batch_size):
+    """
+    Extracting final structures, and re-scaling
+    """
+    
+    x2_pos_final = x2_pos_t[~virtual_node_mask_x2].numpy()
+
+    x3_pos_final = x3_pos_t[~virtual_node_mask_x3].numpy()
+    x3_x_final = x3_x_t[~virtual_node_mask_x3].numpy()
+    x3_x_final = x3_x_final / params['dataset']['x3']['scale_node_features']
+    
+    x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4] - params['dataset']['x4']['scale_node_features']), axis = -1)
+    x4_x_final = x4_x_final - 1 # readjusting for the previous addition of the virtual node pharmacophore type
+    x4_pos_final = x4_pos_t[~virtual_node_mask_x4].numpy()
+    
+    x4_direction_final = x4_direction_t[~virtual_node_mask_x4].numpy() / params['dataset']['x4']['scale_vector_features']
+    x4_direction_final_norm = np.linalg.norm(x4_direction_final, axis = 1)
+    x4_direction_final[x4_direction_final_norm < 0.5] = 0.0
+    x4_direction_final[x4_direction_final_norm >= 0.5] = x4_direction_final[x4_direction_final_norm >= 0.5] / x4_direction_final_norm[x4_direction_final_norm >= 0.5][..., None]
+    
+    
+    x1_x_t[~virtual_node_mask_x1, 0] = -np.inf # this masks out remaining probability assigned to virtual nodes
+    x1_pos_final = x1_pos_t[~virtual_node_mask_x1].numpy()
+    x1_x_final = np.argmin(np.abs(x1_x_t[~virtual_node_mask_x1, 0:-len(params['dataset']['x1']['charge_types'])] - params['dataset']['x1']['scale_atom_features']), axis = -1)
+    x1_bond_edge_x_final = np.argmin(np.abs(x1_bond_edge_x_t - params['dataset']['x1']['scale_bond_features']), axis = -1)
+    
+    # need to remap the indices in x1_x_final to the list of atom types
+    atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14]) # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
+    x1_x_final = atomic_number_remapping[x1_x_final]
+    
+    
+    # return generated structures
+    generated_structures = []
+    for b in range(batch_size):
+        generated_dict = {
+            'x1': {
+                'atoms': np.split(x1_x_final.numpy(), batch_size)[b],
+                #'formal_charges': None, # still need to extract from x1_x_t[~virtual_node_mask_x1, -len(params['dataset']['x1']['charge_types']):]
+                'bonds': np.split(x1_bond_edge_x_final.numpy(), batch_size)[b],
+                'positions': np.split(x1_pos_final, batch_size)[b],
+            },
+            'x2': {
+                'positions': np.split(x2_pos_final, batch_size)[b],
+            },
+            'x3': {
+                'charges': np.split(x3_x_final, batch_size)[b], # electrostatic potential
+                'positions': np.split(x3_pos_final, batch_size)[b],
+            },
+            'x4': {
+                'types': np.split(x4_x_final.numpy(), batch_size)[b],
+                'positions': np.split(x4_pos_final, batch_size)[b],
+                'directions': np.split(x4_direction_final, batch_size)[b],
+            },
+        }
+        generated_structures.append(generated_dict)
+    return generated_structures

@@ -36,7 +36,8 @@ from .steps import (
     _perform_reverse_denoising_step,
     _prepare_model_input,
     _inference_step,
-    _pack_inpainting_dict
+    _pack_inpainting_dict,
+    _extract_generated_samples
 )
 
 from shepherd.shepherd_score_utils.generate_point_cloud import (
@@ -604,60 +605,68 @@ def inference_sample(
         x4_pos_t = next_state['x4_pos_t_1']
         x4_direction_t = next_state['x4_direction_t_1']
         x4_x_t = next_state['x4_x_t_1']
+        noise_dict = next_state['noise_dict']
 
     pbar.close()
  
-    ####### Extracting final structures, and re-scaling ########
+    # ####### Extracting final structures, and re-scaling ########
     
-    x2_pos_final = x2_pos_t[~virtual_node_mask_x2].numpy()
+    # x2_pos_final = x2_pos_t[~virtual_node_mask_x2].numpy()
 
-    x3_pos_final = x3_pos_t[~virtual_node_mask_x3].numpy()
-    x3_x_final = x3_x_t[~virtual_node_mask_x3].numpy()
-    x3_x_final = x3_x_final / params['dataset']['x3']['scale_node_features']
+    # x3_pos_final = x3_pos_t[~virtual_node_mask_x3].numpy()
+    # x3_x_final = x3_x_t[~virtual_node_mask_x3].numpy()
+    # x3_x_final = x3_x_final / params['dataset']['x3']['scale_node_features']
     
-    x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4] - params['dataset']['x4']['scale_node_features']), axis = -1)
-    x4_x_final = x4_x_final - 1 # readjusting for the previous addition of the virtual node pharmacophore type
-    x4_pos_final = x4_pos_t[~virtual_node_mask_x4].numpy()
+    # x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4] - params['dataset']['x4']['scale_node_features']), axis = -1)
+    # x4_x_final = x4_x_final - 1 # readjusting for the previous addition of the virtual node pharmacophore type
+    # x4_pos_final = x4_pos_t[~virtual_node_mask_x4].numpy()
     
-    x4_direction_final = x4_direction_t[~virtual_node_mask_x4].numpy() / params['dataset']['x4']['scale_vector_features']
-    x4_direction_final_norm = np.linalg.norm(x4_direction_final, axis = 1)
-    x4_direction_final[x4_direction_final_norm < 0.5] = 0.0
-    x4_direction_final[x4_direction_final_norm >= 0.5] = x4_direction_final[x4_direction_final_norm >= 0.5] / x4_direction_final_norm[x4_direction_final_norm >= 0.5][..., None]
-    
-    
-    x1_x_t[~virtual_node_mask_x1, 0] = -np.inf # this masks out remaining probability assigned to virtual nodes
-    x1_pos_final = x1_pos_t[~virtual_node_mask_x1].numpy()
-    x1_x_final = np.argmin(np.abs(x1_x_t[~virtual_node_mask_x1, 0:-len(params['dataset']['x1']['charge_types'])] - params['dataset']['x1']['scale_atom_features']), axis = -1)
-    x1_bond_edge_x_final = np.argmin(np.abs(x1_bond_edge_x_t - params['dataset']['x1']['scale_bond_features']), axis = -1)
-    
-    # need to remap the indices in x1_x_final to the list of atom types
-    atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14]) # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
-    x1_x_final = atomic_number_remapping[x1_x_final]
+    # x4_direction_final = x4_direction_t[~virtual_node_mask_x4].numpy() / params['dataset']['x4']['scale_vector_features']
+    # x4_direction_final_norm = np.linalg.norm(x4_direction_final, axis = 1)
+    # x4_direction_final[x4_direction_final_norm < 0.5] = 0.0
+    # x4_direction_final[x4_direction_final_norm >= 0.5] = x4_direction_final[x4_direction_final_norm >= 0.5] / x4_direction_final_norm[x4_direction_final_norm >= 0.5][..., None]
     
     
-    # return generated structures
-    generated_structures = []
-    for b in range(batch_size):
-        generated_dict = {
-            'x1': {
-                'atoms': np.split(x1_x_final.numpy(), batch_size)[b],
-                #'formal_charges': None, # still need to extract from x1_x_t[~virtual_node_mask_x1, -len(params['dataset']['x1']['charge_types']):]
-                'bonds': np.split(x1_bond_edge_x_final.numpy(), batch_size)[b],
-                'positions': np.split(x1_pos_final, batch_size)[b],
-            },
-            'x2': {
-                'positions': np.split(x2_pos_final, batch_size)[b],
-            },
-            'x3': {
-                'charges': np.split(x3_x_final, batch_size)[b], # electrostatic potential
-                'positions': np.split(x3_pos_final, batch_size)[b],
-            },
-            'x4': {
-                'types': np.split(x4_x_final.numpy(), batch_size)[b],
-                'positions': np.split(x4_pos_final, batch_size)[b],
-                'directions': np.split(x4_direction_final, batch_size)[b],
-            },
-        }
-        generated_structures.append(generated_dict)
+    # x1_x_t[~virtual_node_mask_x1, 0] = -np.inf # this masks out remaining probability assigned to virtual nodes
+    # x1_pos_final = x1_pos_t[~virtual_node_mask_x1].numpy()
+    # x1_x_final = np.argmin(np.abs(x1_x_t[~virtual_node_mask_x1, 0:-len(params['dataset']['x1']['charge_types'])] - params['dataset']['x1']['scale_atom_features']), axis = -1)
+    # x1_bond_edge_x_final = np.argmin(np.abs(x1_bond_edge_x_t - params['dataset']['x1']['scale_bond_features']), axis = -1)
     
+    # # need to remap the indices in x1_x_final to the list of atom types
+    # atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14]) # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
+    # x1_x_final = atomic_number_remapping[x1_x_final]
+    
+    
+    # # return generated structures
+    # generated_structures = []
+    # for b in range(batch_size):
+    #     generated_dict = {
+    #         'x1': {
+    #             'atoms': np.split(x1_x_final.numpy(), batch_size)[b],
+    #             #'formal_charges': None, # still need to extract from x1_x_t[~virtual_node_mask_x1, -len(params['dataset']['x1']['charge_types']):]
+    #             'bonds': np.split(x1_bond_edge_x_final.numpy(), batch_size)[b],
+    #             'positions': np.split(x1_pos_final, batch_size)[b],
+    #         },
+    #         'x2': {
+    #             'positions': np.split(x2_pos_final, batch_size)[b],
+    #         },
+    #         'x3': {
+    #             'charges': np.split(x3_x_final, batch_size)[b], # electrostatic potential
+    #             'positions': np.split(x3_pos_final, batch_size)[b],
+    #         },
+    #         'x4': {
+    #             'types': np.split(x4_x_final.numpy(), batch_size)[b],
+    #             'positions': np.split(x4_pos_final, batch_size)[b],
+    #             'directions': np.split(x4_direction_final, batch_size)[b],
+    #         },
+    #     }
+    #     generated_structures.append(generated_dict)
+    
+    generated_structures = _extract_generated_samples(
+        x1_x_t, x1_pos_t, x1_bond_edge_x_t, virtual_node_mask_x1,
+        x2_pos_t, virtual_node_mask_x2,
+        x3_pos_t, x3_x_t, virtual_node_mask_x3,
+        x4_pos_t, x4_direction_t, x4_x_t, virtual_node_mask_x4,
+        params, batch_size)
+
     return generated_structures

@@ -1,5 +1,7 @@
 basic_inference_results/
 inference_scaling_results/
+inference_scaling_experiments/
+sweep_logs/
 
 # macOS
 *.DS_Store

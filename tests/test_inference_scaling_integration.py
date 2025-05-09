@@ -25,7 +25,8 @@ from shepherd.inference_scaling import (
     CLogPVerifier,
     MultiObjectiveVerifier,
     RandomSearch,
-    ZeroOrderSearch
+    ZeroOrderSearch,
+    SearchOverPaths
 )
 
 
@@ -41,6 +42,8 @@ def parse_args():
                         help='Number of atoms to generate')
     parser.add_argument('--n_pharm', type=int, default=5,
                         help='Number of pharmacophores')
+    parser.add_argument('--M_expansion_per_path', type=int, default=4,
+                        help='Number of expansion steps per path')
     parser.add_argument('--num_trials', type=int, default=10,
                         help='Number of trials for random search')
     parser.add_argument('--batch_size', type=int, default=1,
@@ -48,8 +51,8 @@ def parse_args():
     parser.add_argument('--fast', action='store_true',
                         help='Run with limited trials and steps for quick testing')
     # checkpoint control arguments
-    parser.add_argument('--start_step', type=int, default=1, choices=[1, 2, 3],
-                       help='Step to start from (1=baseline, 2=random search, 3=zero-order search)')
+    parser.add_argument('--start_step', type=int, default=1, choices=[1, 2, 3, 4],
+                       help='Step to start from (1=baseline, 2=random search, 3=zero-order search, 4=search over paths)')
     parser.add_argument('--use_cached', action='store_true',
                        help='Use cached results from previous runs if available')
     parser.add_argument('--skip_plots', action='store_true',
@@ -405,9 +408,116 @@ def run_inference_scaling_test(args):
         results['zero_order_search'] = zo_search_results
     else:
         print("\n=== Skipping Step 3 (Zero-Order Search) ===")
+
+    # Step 4: Run Search Over Paths
+    if args.start_step <= 4:
+        print(f"Loading model from {args.checkpoint}")
+        try:
+            model_pl = LightningModule.load_from_checkpoint(args.checkpoint)
+            model_pl.eval()
+            model_pl.to(device)
+            model_pl.model.device = device
+            print("Model loaded successfully")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            return
+        
+        # set up inference parameters
+        T = model_pl.params['noise_schedules']['x1']['ts'].max()
+        inject_noise_at_ts = list(np.arange(130, 80, -1))
+        inject_noise_scales = [1.0] * len(inject_noise_at_ts)
+        harmonize = True
+        harmonize_ts = [80]
+        harmonize_jumps = [20]
+        
+        # validate harmonize parameters to avoid IndexError
+        if harmonize and not harmonize_ts:
+            print("Warning: harmonize is True but harmonize_ts is empty. Setting harmonize_ts to [80]")
+            harmonize_ts = [80]
+        if harmonize and not harmonize_jumps:
+            print("Warning: harmonize is True but harmonize_jumps is empty. Setting harmonize_jumps to [20]")
+            harmonize_jumps = [20]
+        
+        print(f"Creating model runner for next steps")
+        model_runner = ShepherdModelRunner(
+            model_pl=model_pl,
+            batch_size=1,
+            N_x1=args.n_atoms,
+            N_x4=args.n_pharm,
+            unconditional=True,
+            device=str(device),
+            save_all_noise=True,
+            prior_noise_scale=1.0,
+            denoising_noise_scale=1.0,
+            inject_noise_at_ts=inject_noise_at_ts,
+            inject_noise_scales=inject_noise_scales,
+            harmonize=harmonize,
+            harmonize_ts=harmonize_ts,
+            harmonize_jumps=harmonize_jumps,
+        )
+        
+        # create verifiers
+        print("Creating verifiers")
+        sa_verifier = SAScoreVerifier(weight=1.0)
+        clogp_verifier = CLogPVerifier(weight=1.0)
+        multi_verifier = MultiObjectiveVerifier([sa_verifier, clogp_verifier])
+        # try to load cached search over paths results if requested
+        sop_search_results = None
+        if args.use_cached:
+            sop_search_results = load_results(output_dir, "sop_search_results.pkl")
+        
+        if sop_search_results is None:
+            print(f"\n=== Step 4: Run Search Over Paths ({num_steps} steps) ===")
+            sop_search = SearchOverPaths(multi_verifier, model_runner)
+            (
+            sop_best_score,
+            sop_best_overall_score,
+            sop_best_final_path_idx,
+            sop_best_overall_path_idx,
+            sop_best_final_sample,
+            sop_best_overall_sample,
+            sop_best_final_rdmol,
+            sop_best_overall_rdmol,
+            top_N,
+            all_scores_history,
+            sop_metadata
+            ) = sop_search.search(
+                N_paths=2, M_expansion_per_path=args.M_expansion_per_path,
+                sigma_t_initial=355, delta_f_steps=312, delta_b_steps=324,
+                N_x1=args.n_atoms, N_x4=args.n_pharm, unconditional=True, prior_noise_scale=1.0,
+                verbose=True, device=str(device), callback=None
+            )
+            
+            print(f"Search Over Paths | Best Score: {sop_best_score:.4f}")
+            print(f"Search Over Paths | Score Improvement: {sop_best_score - baseline_results['multi_score']:.4f}")
+            print(f"Search Over Paths | Mean Time per Path: {sop_metadata['mean_time_per_paths']:.2f}s")
+            
+            # save search over paths results
+            sop_search_results = {
+                'best_final_score': sop_best_score,
+                'best_overall_score': sop_best_overall_score,
+                'best_final_path_idx': sop_best_final_path_idx,
+                'best_overall_path_idx': sop_best_overall_path_idx,
+                'best_final_sample': sop_best_final_sample,
+                'best_overall_sample': sop_best_overall_sample,
+                'best_final_rdmol': sop_best_final_rdmol,
+                'best_overall_rdmol': sop_best_overall_rdmol,
+                'metadata': sop_metadata
+            }
+            save_results(sop_search_results, output_dir, "sop_search_results.pkl")
+        else:
+            print("\n=== Step 4: Using cached Search Over Paths results ===")
+            print(f"Search Over Paths | Best Score: {sop_search_results['best_score']:.4f}")
+            print(f"Search Over Paths | Score Improvement: {sop_search_results['best_score'] - baseline_results['multi_score']:.4f}")
+            print(f"Search Over Paths | Mean Time per Path: {sop_search_results['metadata']['mean_time_per_paths']:.2f}s")
+        
+        # store search over paths results
+        results['search_over_paths'] = sop_search_results
+    else:
+        print("\n=== Skipping Step 4 (Search Over Paths) ===")
     
     # generate plots if all required data is available and not skipped
-    if not args.skip_plots and 'baseline' in results and 'random_search' in results and 'zero_order_search' in results:
+    if not args.skip_plots and 'baseline' in results and 'random_search' in results and 'zero_order_search' in results and 'search_over_paths' in results:
         print("\n=== generating plots ===")
         plt.figure(figsize=(10, 6))
         plt.axhline(y=results['baseline']['multi_score'], color='r', linestyle='-', label='Baseline')
