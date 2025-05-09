@@ -20,12 +20,53 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
 
+from shepherd.inference_scaling.utils import create_rdkit_molecule
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (10, 6)
 plt.rcParams['figure.dpi'] = 100
 
+
+def parse_xyz_content(xyz_content):
+    """Parse XYZ file content into atoms and positions lists."""
+    lines = xyz_content.strip().split('\n')
+    if len(lines) < 3:
+        logging.warning("XYZ content has too few lines.")
+        return None, None
+        
+    try:
+        num_atoms = int(lines[0].strip())
+        if len(lines) < num_atoms + 2:
+             logging.warning(f"XYZ header says {num_atoms} atoms, but only {len(lines)-2} coordinate lines found.")
+             num_atoms = len(lines) - 2 
+
+        atoms = []
+        positions = []
+        pt = Chem.GetPeriodicTable()
+        max_atomic_num = 118 
+        element_map = {pt.GetElementSymbol(i).lower(): i for i in range(1, max_atomic_num + 1)}
+
+        for i in range(2, num_atoms + 2):
+            parts = lines[i].split()
+            if len(parts) < 4:
+                logging.warning(f"Skipping malformed line in XYZ: {lines[i]}")
+                continue
+            symbol = parts[0]
+            atomic_num = element_map.get(symbol.lower()) # use the map, lookup lowercase symbol
+            if atomic_num is None:
+                 logging.warning(f"Unknown element symbol '{symbol}' in XYZ line: {lines[i]}. Skipping atom.")
+                 continue # skip atoms with unknown symbols
+            
+            atoms.append(atomic_num)
+            pos = [float(parts[j]) for j in range(1, 4)]
+            positions.append(pos)
+            
+        return np.array(atoms), np.array(positions)
+    except Exception as e:
+        logging.error(f"Error parsing XYZ content: {e}")
+        return None, None
 
 def load_data(experiment_dir):
     """load the all_molecules_log.csv file."""
@@ -52,9 +93,9 @@ def create_output_dir(experiment_dir):
     return output_dir
 
 def plot_score_distributions(df, output_dir):
-    """Plot histograms of SA, cLogP, and combined scores."""
+    """Plot histograms of SA, cLogP, QED, and combined scores."""
     logging.info("Plotting score distributions...")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     
     sns.histplot(df['sa_score'], kde=True, ax=axes[0], bins=20)
     axes[0].set_title('SA Score Distribution')
@@ -64,9 +105,13 @@ def plot_score_distributions(df, output_dir):
     axes[1].set_title('cLogP Score Distribution')
     axes[1].set_xlabel('cLogP Score')
     
-    sns.histplot(df['combined_score'], kde=True, ax=axes[2], bins=20)
-    axes[2].set_title('Combined Score Distribution')
-    axes[2].set_xlabel('Combined Score')
+    sns.histplot(df['qed_score'], kde=True, ax=axes[2], bins=20)
+    axes[2].set_title('QED Score Distribution')
+    axes[2].set_xlabel('QED Score')
+    
+    sns.histplot(df['combined_score'], kde=True, ax=axes[3], bins=20)
+    axes[3].set_title('Combined Score Distribution')
+    axes[3].set_xlabel('Combined Score')
     
     plt.tight_layout()
     plot_path = output_dir / "score_distributions.png"
@@ -130,19 +175,57 @@ def plot_sa_vs_clogp(df, output_dir):
     plt.close(fig)
     logging.info(f"Saved SA vs. cLogP plot to {plot_path}")
 
+def plot_qed_relationships(df, output_dir):
+    """Plot QED score vs. other properties."""
+    logging.info("Plotting QED score relationships...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # QED vs SA Score
+    scatter1 = axes[0].scatter(df['sa_score'], df['qed_score'], c=df['combined_score'], 
+                              cmap='viridis', alpha=0.6, s=15)
+    axes[0].set_title('QED Score vs. SA Score')
+    axes[0].set_xlabel('SA Score')
+    axes[0].set_ylabel('QED Score')
+    axes[0].grid(True, alpha=0.3)
+    cbar1 = fig.colorbar(scatter1, ax=axes[0])
+    cbar1.set_label('Combined Score')
+    
+    # QED vs cLogP Score
+    scatter2 = axes[1].scatter(df['clogp_score'], df['qed_score'], c=df['combined_score'], 
+                              cmap='viridis', alpha=0.6, s=15)
+    axes[1].set_title('QED Score vs. cLogP Score')
+    axes[1].set_xlabel('cLogP Score')
+    axes[1].set_ylabel('QED Score')
+    axes[1].grid(True, alpha=0.3)
+    cbar2 = fig.colorbar(scatter2, ax=axes[1])
+    cbar2.set_label('Combined Score')
+    
+    plt.tight_layout()
+    plot_path = output_dir / "qed_relationships.png"
+    plt.savefig(plot_path)
+    plt.close(fig)
+    logging.info(f"Saved QED relationships plot to {plot_path}")
+
 def plot_chemical_diversity(df, output_dir):
     """Calculate and plot pairwise Tanimoto similarity distribution."""
         
     logging.info("Calculating chemical diversity (this may take a while)...")
     
-    # filter out invalid SMILES
-    valid_smiles = df['smiles'][df['smiles'].notna() & 
-                              ~df['smiles'].str.contains("error", case=False)].tolist()
+    # use the newly processed SMILES column
+    if 'processed_smiles' not in df.columns:
+        logging.error("Column 'processed_smiles' not found. Cannot calculate diversity.")
+        return
+        
+    # filter out invalid SMILES (None or other non-string values)
+    valid_smiles = df['processed_smiles'][df['processed_smiles'].notna() & 
+                                         df['processed_smiles'].apply(lambda x: isinstance(x, str))].tolist()
     
     if len(valid_smiles) < 2:
-        logging.warning("Not enough valid SMILES found to calculate diversity.")
+        logging.warning(f"Not enough valid SMILES found in 'processed_smiles' column ({len(valid_smiles)}) to calculate diversity.")
         return
 
+    logging.info(f"Found {len(valid_smiles)} valid SMILES for diversity calculation.")
     mols = [Chem.MolFromSmiles(s) for s in valid_smiles]
     mols = [m for m in mols if m is not None]
 
@@ -176,6 +259,29 @@ def plot_chemical_diversity(df, output_dir):
     plt.close(fig)
     logging.info(f"Saved Tanimoto similarity plot to {plot_path}")
 
+def rescale_properties(df):
+    """
+    Rescale normalized property scores back to their original scales for better interpretation.
+    
+    Args:
+        df: DataFrame with normalized property scores
+        
+    Returns:
+        DataFrame with additional columns containing rescaled properties
+    """
+    df_rescaled = df.copy()
+    
+    # SA score rescaling (from [0,1] to original [1,10] where 1 is easy, 10 is hard)
+    if 'sa_score' in df.columns:
+        df_rescaled['sa_score_orig'] = 1 + 9 * (1 - df['sa_score'])
+    
+    # cLogP rescaling (from [0,1] to original [-1,15] range)
+    if 'clogp_score' in df.columns:
+        df_rescaled['clogp_orig'] = df['clogp_score'] * 16 - 1  # maps 0->-1, 1->15
+    
+    # QED is already in [0,1] so no rescaling needed
+    
+    return df_rescaled
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize detailed ShEPhERD inference scaling results.')
@@ -193,11 +299,75 @@ def main():
     if df is None:
         sys.exit(1)
 
+    # generate RDKit Mols and SMILES from XYZ
+    logging.info("Processing XYZ files to generate RDKit molecules and SMILES...")
+    processed_smiles = []
+    all_mols_dir = experiment_path / "all_molecules"
+    
+    if not all_mols_dir.is_dir():
+            logging.error(f"'all_molecules' directory not found in {experiment_path}. Cannot process XYZ files.")
+            df['processed_smiles'] = None # Add column even if processing fails
+    else:
+        num_processed = 0
+        num_success = 0
+        # use tqdm for progress bar if available, otherwise simple loop
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(df.itertuples(), total=len(df), desc="Processing XYZ")
+        except ImportError:
+            iterator = df.itertuples()
+
+        for row in iterator:
+            xyz_filename = getattr(row, 'filename', None)
+            current_smiles = None # Default to None
+            if xyz_filename and isinstance(xyz_filename, str) and xyz_filename != "error_generating_xyz":
+                xyz_path = all_mols_dir / xyz_filename
+                if xyz_path.exists():
+                    try:
+                        with open(xyz_path, 'r') as f_xyz:
+                            xyz_content = f_xyz.read()
+                        
+                        atoms, positions = parse_xyz_content(xyz_content)
+                        
+                        if atoms is not None and positions is not None and len(atoms) > 0:
+                            # create minimal sample dict for create_rdkit_molecule
+                            mock_sample = {'x1': {'atoms': atoms, 'positions': positions}}
+                            # suppress debug messages from create_rdkit_molecule during this potentially long loop
+                            logging.getLogger().setLevel(logging.INFO) 
+                            mol = create_rdkit_molecule(mock_sample)
+                            logging.getLogger().setLevel(logging.INFO) # reset level just in case
+                            
+                            if mol:
+                                current_smiles = Chem.MolToSmiles(mol)
+                                num_success += 1
+                            # else: create_rdkit_molecule logs the failure reason
+                        else:
+                            logging.warning(f"Failed to parse content of {xyz_filename}")
+                            
+                    except Exception as e:
+                        logging.error(f"Error reading or processing {xyz_path}: {e}")
+                else:
+                    logging.warning(f"XYZ file not found: {xyz_path}")
+            else:
+                logging.debug(f"Skipping row {getattr(row, 'Index', '?')} due to missing or invalid filename: {xyz_filename}")
+            
+            processed_smiles.append(current_smiles)
+            num_processed += 1
+            # occasionally update progress if tqdm not available
+            if 'iterator' not in locals() and num_processed % 500 == 0:
+                logging.info(f"Processed {num_processed}/{len(df)} XYZ files...")
+
+        df['processed_smiles'] = processed_smiles
+        logging.info(f"Finished processing XYZ. Successfully generated SMILES for {num_success}/{num_processed} files.")
+
+    # -----------------------------------------------------------------
+
     output_dir = create_output_dir(experiment_path)
 
     plot_score_distributions(df, output_dir)
     plot_score_vs_evaluation(df, output_dir)
     plot_sa_vs_clogp(df, output_dir)
+    plot_qed_relationships(df, output_dir)
     plot_chemical_diversity(df, output_dir)
     
     logging.info("Visualization script finished.")

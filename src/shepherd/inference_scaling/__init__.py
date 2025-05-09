@@ -6,6 +6,7 @@ from .verifiers import (
     Verifier,
     SAScoreVerifier,
     CLogPVerifier,
+    QEDVerifier,
     MultiObjectiveVerifier,
 )
 

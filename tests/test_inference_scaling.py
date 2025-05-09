@@ -16,6 +16,7 @@ from shepherd.inference_scaling import (
     Verifier,
     SAScoreVerifier,
     CLogPVerifier,
+    QEDVerifier,
     MultiObjectiveVerifier,
     RandomSearch,
     ZeroOrderSearch,
@@ -27,9 +28,10 @@ from shepherd.inference_scaling import (
 class MockMolecule:
     """Mock RDKit molecule for testing verifiers without RDKit."""
     
-    def __init__(self, sa_score=3.0, logp=2.5):
+    def __init__(self, sa_score=3.0, logp=2.5, qed=0.75):
         self.sa_score = sa_score
         self.logp = logp
+        self.qed = qed
 
 
 @pytest.fixture
@@ -170,20 +172,84 @@ def test_sa_score_verifier(mock_preprocess, mock_load_sa_model, mock_sample, moc
 
 @patch.object(CLogPVerifier, 'preprocess')
 def test_clogp_verifier(mock_preprocess, mock_sample, mock_mol):
-    """Test the cLogP verifier."""
+    """Test the cLogP verifier with continuous scaling."""
     # mock the preprocess method to return our mock molecule
     mock_preprocess.return_value = mock_mol
     
-    # mock RDKit's Crippen.MolLogP
-    with patch('rdkit.Chem.Crippen.MolLogP', return_value=2.5):
-        verifier = CLogPVerifier()
+    # test with a value in the middle of the range
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=7.0):
+        verifier = CLogPVerifier()  # default range is (-1, 15)
         
         score = verifier(mock_sample)
         
         mock_preprocess.assert_called_once_with(mock_sample)
         
-        # check that the score is as expected (value in range gets 1.0)
-        assert score == 1.0
+        # check that the score is as expected
+        # For logP=7.0 with range (-1, 15), expected score is (7.0 - (-1))/(15-(-1)) = 8/16 = 0.5
+        assert score == 0.5
+    
+    # reset the mock
+    mock_preprocess.reset_mock()
+    
+    # test with a value at lower bound
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=-1.0):
+        verifier = CLogPVerifier()
+        score = verifier(mock_sample)
+        assert score == 0.0  # lower bound should map to 0.0
+    
+    # reset the mock
+    mock_preprocess.reset_mock()
+    
+    # test with a value at upper bound
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=15.0):
+        verifier = CLogPVerifier()
+        score = verifier(mock_sample)
+        assert score == 1.0  # upper bound should map to 1.0
+    
+    # reset the mock
+    mock_preprocess.reset_mock()
+    
+    # test with a value outside the range (lower)
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=-2.0):
+        verifier = CLogPVerifier()
+        score = verifier(mock_sample)
+        assert score == 0.0  # below lower bound should be clamped to 0.0
+    
+    # reset the mock
+    mock_preprocess.reset_mock()
+    
+    # test with a value outside the range (upper)
+    with patch('rdkit.Chem.Crippen.MolLogP', return_value=16.0):
+        verifier = CLogPVerifier()
+        score = verifier(mock_sample)
+        assert score == 1.0  # above upper bound should be clamped to 1.0
+
+
+@patch.object(QEDVerifier, 'preprocess')
+def test_qed_verifier(mock_preprocess, mock_sample, mock_mol):
+    """Test the QED verifier."""
+    # mock the preprocess method to return our mock molecule
+    mock_preprocess.return_value = mock_mol
+    
+    # mock RDKit's QED.qed
+    with patch('rdkit.Chem.QED.qed', return_value=0.75):
+        verifier = QEDVerifier()
+        
+        score = verifier(mock_sample)
+        
+        mock_preprocess.assert_called_once_with(mock_sample)
+        
+        # check that the score is as expected (QED is already 0-1)
+        assert score == 0.75
+        
+        # test with custom weights
+        custom_weights = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+        verifier_custom = QEDVerifier(custom_weights=custom_weights)
+        
+        with patch('rdkit.Chem.QED.qed', return_value=0.6) as mock_qed:
+            score_custom = verifier_custom(mock_sample)
+            mock_qed.assert_called_once_with(mock_mol, w=custom_weights)
+            assert score_custom == 0.6
 
 
 def test_multi_objective_verifier(mock_sample):
