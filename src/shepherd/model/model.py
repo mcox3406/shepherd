@@ -72,8 +72,10 @@ class Model(torch.nn.Module):
                     )
                 )
             self.joint_SO3_grid.append(SO3_m_grid)
-            
-        
+
+        self.property_cfg = False
+        if 'property_cfg' in params:
+            self.property_cfg = params['property_cfg']
         
         # Joint Module
 
@@ -276,6 +278,29 @@ class Model(torch.nn.Module):
                 params['x1']['decoder']['time_embedding_size'],
                 params['x1']['decoder']['node_channels'],
             )
+
+            # Assumes these properties [0,1] are scaled by 2.0 -> [0, 2.0]
+            self.x1_decoder_local_property_embedding_sa = GaussianSmearing(
+                start = -0.5,
+                stop = 2.5,
+                num_gaussians = 64,
+            )
+            if self.property_cfg:
+                # "Adaptive" layer
+                self.x1_decoder_local_property_adapter = torch.nn.Linear(
+                    64, # concat SA score
+                    params['x1']['decoder']['node_channels']
+                )
+
+                # https://github.com/lllyasviel/ControlNet
+                # Mix-in layer for finetuning
+                self.x1_decoder_local_property_mix_in = torch.nn.Linear(
+                    params['x1']['decoder']['node_channels'],
+                    params['x1']['decoder']['node_channels'],
+                    bias=False,
+                )
+                # zero-initialize for mix-in layer
+                torch.nn.init.zeros_(self.x1_decoder_local_property_mix_in.weight)
     
             
             x1_decoder_encoder_params = params['x1']['decoder']['encoder']
@@ -802,6 +827,22 @@ class Model(torch.nn.Module):
         x1_timestep_embedding_pernode = x1_timestep_embedding[input_dict['x1']['decoder']['batch']]
         x.embedding[:, 0, :] = x.embedding[:, 0, :] + x1_timestep_embedding_pernode
         
+        # CFG Global property embedding
+        if self.property_cfg:
+            x1_sa_scores = input_dict['x1']['decoder']['global_props_unnoised']#[:, None, 0] # SA score is index 0
+            x1_global_property_embedding_sa = self.x1_decoder_local_property_embedding_sa(x1_sa_scores)
+
+            # Create masks for unconditional
+            property_mask_sa_bool = input_dict['x1']['decoder']['global_props_mask'][:,0]
+            property_mask_sa = torch.ones(x1_global_property_embedding_sa.shape[0], device = self.device)
+            property_mask_sa[property_mask_sa_bool] = 0.0
+
+            x1_global_prop_learned = self.x1_decoder_local_property_adapter(x1_global_property_embedding_sa)
+            x1_global_prop_embedding = self.x1_decoder_local_property_mix_in(x1_global_prop_learned) * property_mask_sa[:, None]
+            x1_global_prop_embedding_pernode = x1_global_prop_embedding[input_dict['x1']['decoder']['batch']]
+
+            # Add property embedding to each node for l=0
+            x.embedding[:, 0, :] = x.embedding[:, 0, :] + x1_global_prop_embedding_pernode
         
         # 3D graph convolution (with EquiformerV2)
         

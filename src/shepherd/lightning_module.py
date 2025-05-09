@@ -30,6 +30,10 @@ class LightningModule(pl.LightningModule):
         self.lr = params['training']['lr']
         self.min_lr = params['training']['min_lr']
         self.lr_steps = params['training']['lr_steps']
+
+        self.property_cfg = False
+        if 'property_cfg' in params:
+            self.property_cfg  = params['property_cfg']
     
     
     def configure_optimizers(self):
@@ -84,6 +88,11 @@ class LightningModule(pl.LightningModule):
                     
                 },
             }
+
+            # Mask for unconditional version of CFG
+            if self.property_cfg:
+                input_dict['x1']['decoder'].update({'global_props_unnoised': data['x1'].global_props})
+                input_dict['x1']['decoder'].update({'global_props_mask': data['x1'].global_props_mask})
         
         
         if self.params['dataset']['compute_x2']:

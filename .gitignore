@@ -2,6 +2,7 @@ basic_inference_results/
 inference_scaling_results/
 inference_scaling_experiments/
 sweep_logs/
+*cfg_finetune.ckpt
 
 # macOS
 *.DS_Store
