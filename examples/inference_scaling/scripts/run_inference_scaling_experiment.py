@@ -7,6 +7,7 @@ for hyperparameter sweeps and longer experiments.
 
 import os
 import sys
+from copy import deepcopy
 import torch
 import numpy as np
 import argparse
@@ -65,6 +66,12 @@ def parse_args():
                         help='Number of pharmacophores')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for inference')
+    
+    # repeat and experiment ID options
+    parser.add_argument('--repeat_N', type=int, default=1,
+                        help='Number of times to repeat the experiment')
+    parser.add_argument('--run_id', type=str, default=None,
+                        help='Optional ID to append to the random experiment name')
     
     # search parameters
     parser.add_argument('--num_trials', type=int, default=50,
@@ -125,6 +132,14 @@ def parse_args():
                         help='Number of steps to forward noise')
     parser.add_argument('--delta_b', type=float, default=324,
                         help='Number of steps to reverse noise. Must be larger than delta_f.')
+
+    # classifier-free guidance (CFG) parameters
+    parser.add_argument('--do_property_cfg', action='store_true', default=False,
+                        help='Enable Classifier-Free Guidance (CFG) mode')
+    parser.add_argument('--cfg_weight', type=float, default=1.0,
+                        help='Scale for Classifier-Free Guidance')
+    parser.add_argument('--sa_score_target_value', type=float, default=1.0,
+                        help='Target value for the guided property in CFG')
     
     return parser.parse_args()
 
@@ -154,6 +169,8 @@ def generate_experiment_name(args):
     
     if args.algorithm == 'random':
         name_parts.append(f"{args.algorithm}_trials{args.num_trials}")
+        if args.run_id:
+            name_parts.append(f"run{args.run_id}")
     elif args.algorithm == 'zero_order':
         name_parts.append(f"{args.algorithm}_steps{args.num_steps}_nbrs{args.num_neighbors}_ss{args.step_size}")
     elif args.algorithm == 'guided':
@@ -168,6 +185,12 @@ def generate_experiment_name(args):
             name_parts.append(f"steps{args.num_sampling_steps}")
         if args.sampler_type == 'ddim':
              name_parts.append(f"eta{args.ddim_eta}")
+
+    # add CFG info if enabled
+    if args.do_property_cfg:
+        name_parts.append("cfg")
+        name_parts.append(f"cfg_weight{args.cfg_weight}")
+        name_parts.append(f"sa_score_target{args.sa_score_target_value}")
 
     name_parts.append(timestamp)
     return "_".join(name_parts)
@@ -317,7 +340,10 @@ def run_experiment(args):
             harmonize_jumps=harmonize_jumps,
             sampler_type=args.sampler_type,
             num_steps=args.num_sampling_steps,
-            ddim_eta=args.ddim_eta
+            ddim_eta=args.ddim_eta,
+            do_property_cfg=args.do_property_cfg,
+            cfg_weight=args.cfg_weight,
+            sa_score=args.sa_score_target_value
         )
         
         print("Creating verifiers")
@@ -343,7 +369,7 @@ def run_experiment(args):
                 filepath_xyz = all_mols_dir / filename_xyz
 
                 # 2. generate and save xyz content
-                xyz_content = get_xyz_content(sample)
+                xyz_content = get_xyz_content(deepcopy(sample))
                 if xyz_content:
                     with open(filepath_xyz, 'w') as f:
                         f.write(xyz_content)
@@ -356,7 +382,7 @@ def run_experiment(args):
                 smiles = "error_creating_mol"
                 try:
                     mol = create_rdkit_molecule(sample)
-                    if mol:
+                    if mol is not None:
                         smiles = Chem.MolToSmiles(mol)
                 except Exception as e:
                     logging.debug(f"Could not get SMILES for {filename_xyz}: {e}")
@@ -563,7 +589,7 @@ def run_experiment(args):
         # Save results
         print("\nSaving results...")
         if save_results(results, output_path):
-            print("Results saved successfully")
+            print(f"Results saved successfully to {output_path}")
         else:
             print("Warning: Failed to save some results")
         
@@ -598,4 +624,63 @@ def run_experiment(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_experiment(args)
+    
+    original_output_dir = args.output_dir 
+    original_exp_name = args.exp_name # Store original exp_name if provided
+
+    if args.repeat_N > 1:
+        print(f"--- Experiment configured to run {args.repeat_N} times ---")
+
+    all_run_results_summary = []
+
+    for i in range(args.repeat_N):
+        print(f"--- Starting run {i+1}/{args.repeat_N} ---")
+        
+        current_args = argparse.Namespace(**vars(args)) # Create a mutable copy for this iteration
+
+        # Modify output directory for this specific run to prevent overwrites
+        # Results for repeat i will go into original_output_dir / repeat_i / <generated_exp_name>
+        if args.run_id is not None:
+            current_args.output_dir = str(Path(original_output_dir) / f"{args.run_id}" / f"repeat_{i}")
+        else:
+            current_args.output_dir = str(Path(original_output_dir) / f"repeat_{i}")
+        
+        # If an original exp_name was given, append repeat index to it for clarity in subfolder naming.
+        # Otherwise, generate_experiment_name will create a unique name (potentially with run_id).
+        if original_exp_name:
+            current_args.exp_name = f"{original_exp_name}_repeat{i}"
+        else:
+            # Ensure exp_name is None so generate_experiment_name creates a new one based on params + run_id
+            current_args.exp_name = None 
+
+        # The generate_experiment_name function will be called inside run_experiment,
+        # using current_args.exp_name (if set) or generating one (using current_args.run_id for random).
+        
+        results = run_experiment(current_args) 
+        
+        if results: # Store key summary metrics if run succeeded
+            all_run_results_summary.append({
+                'run_index': i,
+                'best_score': results.get('best_score'),
+                'nfe': results.get('metadata', {}).get('nfe'),
+                'output_path': results.get('final_output_path') # Get the path where results were saved
+            })
+        else:
+            print(f"--- Run {i+1}/{args.repeat_N} failed or did not return results ---")
+
+    print(f"--- Completed {args.repeat_N} runs ---")
+
+    if args.repeat_N > 1 and all_run_results_summary:
+        print("\n--- Summary of all runs ---")
+        for res_summary in all_run_results_summary:
+            # Ensure values exist before formatting
+            score_str = f"{res_summary.get('best_score', 'N/A'):.4f}" if isinstance(res_summary.get('best_score'), (int, float)) else str(res_summary.get('best_score', 'N/A'))
+            nfe_str = str(res_summary.get('nfe', 'N/A'))
+            path_str = str(res_summary.get('output_path', 'N/A'))
+            print(f"Run {res_summary.get('run_index', '?')}: Best Score: {score_str}, NFE: {nfe_str}, Output Dir: {path_str}")
+        
+        # Example: Calculate and print mean/std of best scores
+        valid_scores = [r['best_score'] for r in all_run_results_summary if isinstance(r.get('best_score'), (int, float))]
+        if valid_scores:
+            print(f"\nMean Best Score across {len(valid_scores)} successful runs: {np.mean(valid_scores):.4f}")
+            print(f"Std Dev Best Score across {len(valid_scores)} successful runs: {np.std(valid_scores):.4f}")

@@ -7,6 +7,7 @@ sop_plots/
 slurm_outputs/
 inference_scaling_test_results/
 cfg_plots/
+*.sh
 
 # macOS
 *.DS_Store

@@ -125,7 +125,7 @@ def main():
     base_config = {
         # Model and output configuration
         "checkpoint": "../../data/shepherd_chkpts/x1x3x4_diffusion_mosesaq_20240824_submission.ckpt",
-        "output_dir": "inference_scaling_experiments/search_over_paths",
+        "output_dir": "inference_scaling_experiments/search_over_paths/multi_objective",
         "algorithm": "search_over_paths",  # Specify the search algorithm
         "verbose": True,
         
@@ -138,7 +138,7 @@ def main():
         "n_atoms": 40,         # Number of atoms to generate
         "n_pharm": 10,          # Number of pharmacophores
         "sa_weight": 1.0,      # Weight for synthetic accessibility score
-        "clogp_weight": 0.0,   # Weight for cLogP score
+        "clogp_weight": 1.0,   # Weight for cLogP score
         
         # Sampler configuration
         "sampler_type": "ddpm",  # Sampling algorithm (ddpm or ddim)
@@ -155,8 +155,8 @@ def main():
     }
     
     # Parameter sweep values
-    N_values = [2, 4, 8]  # Number of paths
-    M_values = [10, 15, 5]  # Number of samples per path
+    N_values = [2, 8]  # Number of paths
+    M_values = [15, 5]  # Number of samples per path
     
     # Create output directory
     output_dir = Path(base_config["output_dir"])
