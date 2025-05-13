@@ -2,6 +2,7 @@
 Contains the process to perform one step of reverse denoising.
 """
 from typing import Optional
+from copy import deepcopy
 from tqdm import tqdm
 import torch
 import numpy as np
@@ -374,7 +375,8 @@ def _prepare_model_input(device, dtype, batch_size, t,
                          x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, x1_bond_edge_index, x1_virtual_node_mask, x1_params, 
                          x2_pos_t, x2_x_t, x2_batch, x2_virtual_node_mask, x2_params, 
                          x3_pos_t, x3_x_t, x3_batch, x3_virtual_node_mask, x3_params, 
-                         x4_pos_t, x4_direction_t, x4_x_t, x4_batch, x4_virtual_node_mask, x4_params):
+                         x4_pos_t, x4_direction_t, x4_x_t, x4_batch, x4_virtual_node_mask, x4_params,
+                         x1_global_prop_t = None):
     
     x1_timestep = torch.tensor([t] * batch_size)
     x2_timestep = torch.tensor([t] * batch_size)
@@ -444,6 +446,12 @@ def _prepare_model_input(device, dtype, batch_size, t,
             },
         },
     }
+
+    if x1_global_prop_t is not None:
+        # Conditional
+        input_dict['x1']['decoder']['global_props_unnoised'] = x1_global_prop_t.to(input_dict['device'])
+        global_props_mask = np.array([[False]])
+        input_dict['x1']['decoder']['global_props_mask'] = torch.as_tensor(global_props_mask, dtype=torch.bool).repeat(batch_size,1).to(device)
     return input_dict
 
 
@@ -494,7 +502,10 @@ def _inference_step(
     inpaint_x2_pos, inpaint_x3_pos, inpaint_x3_x, inpaint_x4_pos, inpaint_x4_direction, inpaint_x4_type,
     inpainting_dict: Optional[dict] = None,
     # progress bar
-    pbar: Optional[tqdm] = None
+    pbar: Optional[tqdm] = None,
+    # Property CFG
+    x1_global_prop_t=None,
+    cfg_weight=0.0 # default is unconditional
     ):
     """
     Inner loop for the denoising process.
@@ -696,13 +707,66 @@ def _inference_step(
         x1_pos_t, x1_x_t, x1_batch, x1_bond_edge_x_t, bond_edge_index_x1, virtual_node_mask_x1, x1_params_current,
         x2_pos_t, x2_x_t, x2_batch, virtual_node_mask_x2, x2_params_current,
         x3_pos_t, x3_x_t, x3_batch, virtual_node_mask_x3, x3_params_current,
-        x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params_current
+        x4_pos_t, x4_direction_t, x4_x_t, x4_batch, virtual_node_mask_x4, x4_params_current,
+        x1_global_prop_t=x1_global_prop_t # for CFG
     )
+
+    if x1_global_prop_t is not None:
+        # Unconditional
+        output_dict_unconditioned = None
+        input_dict_unconditioned = deepcopy(input_dict)
+        global_props_mask = np.array([[True]])
+        input_dict_unconditioned['x1']['decoder']['global_props_mask'] = torch.as_tensor(global_props_mask, dtype=torch.bool).repeat(batch_size,1).to(input_dict['device'])
+
+        for key in ['x1', 'x2', 'x3', 'x4']:
+            for k, v in input_dict_unconditioned[key]['decoder'].items():
+                if v is not None:
+                    input_dict_unconditioned[key]['decoder'][k] = v.to(input_dict['device'])
+                else:
+                    input_dict_unconditioned[key]['decoder'][k] = None
+    
+        if not np.isclose(cfg_weight, 0.0):
+            with torch.no_grad():
+                _, output_dict_unconditioned = model_pl.model.forward(input_dict_unconditioned)
 
     # predict noise with neural network    
     with torch.no_grad():
         _, output_dict = model_pl.model.forward(input_dict)
-    
+
+    # classifier-free guidance
+    if x1_global_prop_t is not None and not np.isclose(cfg_weight, 0.0):
+        output_dict['x1']['decoder']['denoiser']['pos_out'] = (1 + cfg_weight) * output_dict['x1']['decoder']['denoiser']['pos_out'] - cfg_weight * output_dict_unconditioned['x1']['decoder']['denoiser']['pos_out']
+        output_dict['x1']['decoder']['denoiser']['x_out'] = (1 + cfg_weight) * output_dict['x1']['decoder']['denoiser']['x_out'] - cfg_weight * output_dict_unconditioned['x1']['decoder']['denoiser']['x_out']
+        output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'] = (1 + cfg_weight) * output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'] - cfg_weight * output_dict_unconditioned['x1']['decoder']['denoiser']['bond_edge_x_out']
+
+        if output_dict['x2']['decoder']['denoiser']['pos_out'] is not None:
+            output_dict['x2']['decoder']['denoiser']['pos_out'] = (1 + cfg_weight) * output_dict['x2']['decoder']['denoiser']['pos_out'] - cfg_weight * output_dict_unconditioned['x2']['decoder']['denoiser']['pos_out']
+        else:
+            output_dict['x2']['decoder']['denoiser']['pos_out'] = torch.zeros_like(x2_pos_t)
+        
+        if output_dict['x3']['decoder']['denoiser']['pos_out'] is not None:
+            output_dict['x3']['decoder']['denoiser']['pos_out'] = (1 + cfg_weight) * output_dict['x3']['decoder']['denoiser']['pos_out'] - cfg_weight * output_dict_unconditioned['x3']['decoder']['denoiser']['pos_out']
+            output_dict['x3']['decoder']['denoiser']['x_out'] = (1 + cfg_weight) * output_dict['x3']['decoder']['denoiser']['x_out'] - cfg_weight * output_dict_unconditioned['x3']['decoder']['denoiser']['x_out']
+        else:
+            output_dict['x3']['decoder']['denoiser']['pos_out'] = torch.zeros_like(x3_pos_t)
+            output_dict['x3']['decoder']['denoiser']['x_out'] = torch.zeros_like(x3_x_t)
+
+
+        x4_x_out = output_dict['x4']['decoder']['denoiser']['x_out']
+        x4_pos_out = output_dict['x4']['decoder']['denoiser']['pos_out']
+        x4_direction_out = output_dict['x4']['decoder']['denoiser']['direction_out']
+        if output_dict['x4']['decoder']['denoiser']['x_out'] is not None:
+            output_dict['x4']['decoder']['denoiser']['pos_out'] = (1 + cfg_weight) * output_dict['x4']['decoder']['denoiser']['pos_out'] - cfg_weight * output_dict_unconditioned['x4']['decoder']['denoiser']['pos_out']
+            output_dict['x4']['decoder']['denoiser']['direction_out'] = (1 + cfg_weight) * output_dict['x4']['decoder']['denoiser']['direction_out'] - cfg_weight * output_dict_unconditioned['x4']['decoder']['denoiser']['direction_out']
+            output_dict['x4']['decoder']['denoiser']['x_out'] = (1 + cfg_weight) * output_dict['x4']['decoder']['denoiser']['x_out'] - cfg_weight * output_dict_unconditioned['x4']['decoder']['denoiser']['x_out']
+        else:
+            output_dict['x4']['decoder']['denoiser']['pos_out'] = torch.zeros_like(x4_pos_t)
+            output_dict['x4']['decoder']['denoiser']['direction_out'] = torch.zeros_like(x4_direction_t)
+            output_dict['x4']['decoder']['denoiser']['x_out'] = torch.zeros_like(x4_x_t)
+
+        del output_dict_unconditioned
+        del input_dict_unconditioned
+
     x1_x_out = output_dict['x1']['decoder']['denoiser']['x_out'].detach().cpu()
     x1_bond_edge_x_out = output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'].detach().cpu()
     x1_pos_out = output_dict['x1']['decoder']['denoiser']['pos_out'].detach().cpu()
@@ -808,7 +872,9 @@ def _extract_generated_samples(
         x2_pos_t, virtual_node_mask_x2,
         x3_pos_t, x3_x_t, virtual_node_mask_x3,
         x4_pos_t, x4_direction_t, x4_x_t, virtual_node_mask_x4,
-        params, batch_size):
+        params, batch_size,
+        x1_global_prop_t=None
+        ):
     """
     Extracting final structures, and re-scaling
     """
@@ -837,7 +903,10 @@ def _extract_generated_samples(
     # need to remap the indices in x1_x_final to the list of atom types
     atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14]) # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
     x1_x_final = atomic_number_remapping[x1_x_final]
-    
+
+    if x1_global_prop_t is not None:
+        x1_sa_final = x1_global_prop_t[:, 0].numpy() / params['dataset']['x1']['scale_prop_features']
+        x1_sa_final = 10 - 9*x1_sa_final # project back to [1,10]
     
     # return generated structures
     generated_structures = []
@@ -862,5 +931,7 @@ def _extract_generated_samples(
                 'directions': np.split(x4_direction_final, batch_size)[b],
             },
         }
+        if x1_global_prop_t is not None:
+            generated_dict['x1']['sa'] = np.split(x1_sa_final, batch_size)[b][0]
         generated_structures.append(generated_dict)
     return generated_structures

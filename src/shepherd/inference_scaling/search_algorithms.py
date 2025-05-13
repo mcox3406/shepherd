@@ -13,6 +13,7 @@ import sys
 
 from rdkit import Chem
 
+from shepherd.inference import inference_sample
 from shepherd.inference.initialization import (
     _initialize_x1_state, _initialize_x2_state, _initialize_x3_state, _initialize_x4_state
 )
@@ -23,6 +24,23 @@ from shepherd.inference.steps import (
     _perform_reverse_denoising_step,
     _extract_generated_samples
 )
+
+
+# Context manager to temporarily modify the root logger's level
+class _ModifyRootLoggerLevelContext:
+    def __init__(self, temp_level=logging.CRITICAL):
+        self.root_logger = logging.getLogger() # Get the root logger
+        self.original_level = None
+        self.temp_level = temp_level
+
+    def __enter__(self):
+        self.original_level = self.root_logger.level
+        self.root_logger.setLevel(self.temp_level)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.original_level is not None:
+            self.root_logger.setLevel(self.original_level)
 
 
 class SearchAlgorithm:
@@ -77,7 +95,9 @@ class RandomSearch(SearchAlgorithm):
         Args:
             num_trials (int): Number of random noise vectors to try.
             verbose (bool): Whether to print progress information.
-            device (str): Device to run the model on ("cpu" or "cuda").
+            device (str): Device to run the model on ("cpu" or "cuda"). 
+                          Note: for RandomSearch using direct inference_sample, 
+                          model_pl should already be on the correct device.
             callback (callable, optional): Function to call after each trial with signature
                                         callback(trial, sample, score, best_sample, best_score, scores).
             
@@ -90,40 +110,72 @@ class RandomSearch(SearchAlgorithm):
         times = []
         nfe_count = 0
         
+        # Calculate number of batches needed to reach num_trials
+        num_batches = int(np.ceil(num_trials / self.model_runner.batch_size))
+        # if verbose:
+        logging.info(f"Running {num_batches} batches of size {self.model_runner.batch_size} to achieve {num_trials} trials")
+        
         if verbose:
-            iterator = tqdm(range(num_trials), desc="Random Search")
+            pbar = tqdm(total=num_batches, desc="Random Search", position=0, leave=True)
         else:
-            iterator = range(num_trials)
+            pbar = None
+
+        processed_trials = 0
+        while processed_trials < num_trials:
+            batch_start_time = time.time()
+            
+            # Directly call inference_sample for a batch of random samples
+            # Arguments are sourced from self.model_runner attributes
+            samples_in_batch = inference_sample(
+                model_pl=self.model_runner.model_pl,
+                batch_size=self.model_runner.batch_size,
+                N_x1=self.model_runner.N_x1,
+                N_x4=self.model_runner.N_x4,
+                unconditional=self.model_runner.unconditional,
+                sampler_type=self.model_runner.sampler_type,
+                num_steps=self.model_runner.num_steps,
+                ddim_eta=self.model_runner.ddim_eta,
+                verbose=False,
+                **self.model_runner.inference_kwargs 
+            )
+            
+            if not isinstance(samples_in_batch, list):
+                logging.error("inference_sample did not return a list. Wrapping in a list.")
+                samples_in_batch = [samples_in_batch]
+
+            for sample_idx_in_batch, sample in enumerate(samples_in_batch):
+                if processed_trials >= num_trials:
+                    break
+                
+                current_sample_score = self.verifier(sample)
+                nfe_count += 1
+                scores.append(current_sample_score)
+                
+                if current_sample_score > best_score:
+                    best_score = current_sample_score
+                    best_sample = sample 
+                    if verbose and pbar:
+                        pbar.set_description(f"Random Search (Best: {best_score:.4f})")
+                
+                if callback is not None:
+                    callback(algorithm='random', iteration=processed_trials, sample=sample, score=current_sample_score)
+                
+                processed_trials += 1
+
+            pbar.update(1)
+            pbar.refresh()  # Force refresh the display
+            
+            times.append(time.time() - batch_start_time) 
         
-        for i in iterator:
-            start_time = time.time()
+        if pbar:
+            pbar.close()
             
-            # generate sample with a random noise vector
-            sample = self.model_runner()
-            
-            # evaluate sample
-            score = self.verifier(sample)
-            nfe_count += 1
-            scores.append(score)
-            
-            # update best
-            if score > best_score:
-                best_score = score
-                best_sample = sample
-                if verbose:
-                    logging.info(f"Trial {i+1}/{num_trials}: New best score: {best_score:.4f}")
-            
-            # call callback if provided, passing trial context
-            if callback is not None:
-                callback(algorithm='random', iteration=i, sample=sample, score=score)
-            
-            times.append(time.time() - start_time)
-        
         metadata = {
-            "mean_time_per_trial": np.mean(times),
+            "mean_time_per_trial": np.mean(times) / self.model_runner.batch_size if self.model_runner.batch_size > 0 and len(times) > 0 else 0, # Approximate per trial
             "total_time": sum(times),
             "num_trials": num_trials,
-            "nfe": nfe_count
+            "nfe": nfe_count,
+            "batch_size_used": self.model_runner.batch_size
         }
         
         return best_sample, best_score, scores, metadata
@@ -147,6 +199,16 @@ class ZeroOrderSearch(SearchAlgorithm):
             name (str, optional): Name of the search algorithm.
         """
         super().__init__(verifier, model_runner, name)
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        
+        # Only add a handler if the root logger doesn't have any handlers
+        root_logger = logging.getLogger()
+        if not root_logger.handlers:
+            # Add a console handler if none exists
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(console_handler)
         
     def search(self, num_steps=20, num_neighbors=5, step_size=0.1, 
                init_noise=None, verbose=True, device="cpu", callback=None):
@@ -211,7 +273,8 @@ class ZeroOrderSearch(SearchAlgorithm):
                 neighbor_sample = self.model_runner(noise=neighbor_noise)
                 
                 # evaluate sample
-                neighbor_score = self.verifier(neighbor_sample)
+                with _ModifyRootLoggerLevelContext(temp_level=logging.CRITICAL):
+                    neighbor_score = self.verifier(neighbor_sample)
                 nfe_count += 1
                 
                 neighbor_samples.append(neighbor_sample)
@@ -239,7 +302,7 @@ class ZeroOrderSearch(SearchAlgorithm):
                 pivot_noise = neighbor_noises[best_idx]
                 
                 if verbose:
-                    logging.info(f"Step {step+1}/{num_steps}: New pivot score: {pivot_score:.4f}")
+                    self.logger.info(f"Step {step+1}/{num_steps}: New pivot score: {pivot_score:.4f}")
             
             scores.append(pivot_score)
             times.append(time.time() - start_time)
@@ -752,10 +815,13 @@ class SearchOverPaths(SearchAlgorithm):
         Returns list of scores for each generated structure.
         """
         scores = []
-        for structure in generated_structures:
-            # Evaluate the generated structure with the verifier
-            score = self.verifier(structure)
-            scores.append(score)
+        # Temporarily raise root logger level to CRITICAL to suppress 
+        # INFO, WARNING, and ERROR messages from verifiers that use the root logger.
+        with _ModifyRootLoggerLevelContext(temp_level=logging.CRITICAL):
+            for structure in generated_structures:
+                # Evaluate the generated structure with the verifier
+                score = self.verifier(structure)
+                scores.append(score)
         return scores
 
 
@@ -952,8 +1018,8 @@ class SearchOverPaths(SearchAlgorithm):
 
                 if max(scores) > best_score:
                     best_score = max(scores)
-                    if verbose:
-                        self.logger.info(f"Path {n_path+1}: New best score: {best_score:.4f}")
+                    # if verbose:
+                    self.logger.info(f"Path {n_path+1}: New best score: {best_score:.4f}")
 
                 if callback is not None:
                     callback(
@@ -997,12 +1063,12 @@ class SearchOverPaths(SearchAlgorithm):
                 current_time_idx = deepcopy(less_noised_time_idx)
                 current_state = deepcopy(best_state)  # Use the best state as the new current state
 
-                if verbose:
-                    self.logger.info(f"Path {n_path+1}/{N_paths} | Iteration {ticker} | t_fwd={current_time_idx}, t_int={noised_time_idx} | Best score: {best_score:.4f}")
+                # if verbose:
+                self.logger.info(f"Path {n_path+1}/{N_paths} | Iteration {ticker} | t_fwd={current_time_idx}, t_int={noised_time_idx} | Best score: {best_score:.4f}")
 
-            if verbose:
-                evol = ' -> '.join([f"{s:.4f}" for s in best_score_evolution])
-                self.logger.info(f'Path {n_path+1}/{N_paths} score evolution: {evol}')
+            # if verbose:
+            evol = ' -> '.join([f"{s:.4f}" for s in best_score_evolution])
+            self.logger.info(f'Path {n_path+1}/{N_paths} score evolution: {evol}')
 
             times.append(time.time() - start_time)
 

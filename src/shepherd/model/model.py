@@ -279,13 +279,14 @@ class Model(torch.nn.Module):
                 params['x1']['decoder']['node_channels'],
             )
 
-            # Assumes these properties [0,1] are scaled by 2.0 -> [0, 2.0]
-            self.x1_decoder_local_property_embedding_sa = GaussianSmearing(
-                start = -0.5,
-                stop = 2.5,
-                num_gaussians = 64,
-            )
             if self.property_cfg:
+                # Assumes these properties [0,1] are scaled by 2.0 -> [0, 2.0]
+                self.x1_decoder_local_property_embedding_sa = GaussianSmearing(
+                    start = -0.5,
+                    stop = 2.5,
+                    num_gaussians = 64,
+                )
+                
                 # "Adaptive" layer
                 self.x1_decoder_local_property_adapter = torch.nn.Linear(
                     64, # concat SA score

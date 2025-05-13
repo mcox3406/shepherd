@@ -3,6 +3,10 @@ inference_scaling_results/
 inference_scaling_experiments/
 sweep_logs/
 *cfg_finetune.ckpt
+sop_plots/
+slurm_outputs/
+inference_scaling_test_results/
+cfg_plots/
 
 # macOS
 *.DS_Store

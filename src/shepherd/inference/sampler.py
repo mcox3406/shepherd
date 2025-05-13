@@ -108,6 +108,11 @@ def inference_sample(
     start_t_ind: int = 0,
     xi_initial_dict: Optional[dict] = None,
     noise_dict: Optional[dict] = None,
+
+    do_property_cfg = False,
+    cfg_weight = 3.0,
+    sa_score = 1.0,
+    verbose = True
 ):
     """
     Runs inference of ShEPhERD to sample `batch_size` number of molecules.
@@ -184,6 +189,11 @@ def inference_sample(
         After the first inference step, the noise will be sampled randomly.
         If None, the noises will be sampled randomly.
 
+    do_property_cfg : bool (default = False) Whether to use property conditioning.
+    cfg_weight : float (default = 3.0) Weight of property conditioning.
+    sa_score : float (default = 1.0) SA score of the target molecule.
+        Range is 0-10: 10 is difficult to synthesize.
+
     Returns
     -------
     generated_structures : List[Dict]
@@ -235,6 +245,14 @@ def inference_sample(
     if start_t_ind != 0 and xi_initial_dict is None:
         raise ValueError("xi_initial_dict must be provided if start_t_ind is not 0.")
     
+    if do_property_cfg:
+        # sa_score = sa_score + np.random.uniform(0., 2., size = (batch_size, 1)) # 1-3.5
+        sa_score = np.ones((batch_size, 1)) * sa_score # 1-3.5
+        sa_score_normalized = (10 - sa_score)/9 # 0-1 (1 is better synthetic accessibility)
+        sa_score_scaled = sa_score_normalized * params['dataset']['x1']['scale_prop_features']
+
+        # defining inpainting targets
+        target_global_props = torch.as_tensor(sa_score_scaled, dtype = torch.float)
     
     ####### Defining inpainting targets ########
 
@@ -448,6 +466,11 @@ def inference_sample(
     x1_pos_t = pos_forward_noised_x1
     x1_x_t = x_forward_noised_x1
     x1_bond_edge_x_t = bond_edge_x_forward_noised_x1
+
+    if do_property_cfg: # Property CFG
+        x1_global_prop_t = target_global_props
+    else:
+        x1_global_prop_t = None
     
     x2_pos_t = pos_forward_noised_x2
     x2_x_t = x_forward_noised_x2
@@ -577,9 +600,13 @@ def inference_sample(
         inpaint_x4_pos=inpaint_x4_pos, inpaint_x4_direction=inpaint_x4_direction,
         inpaint_x4_type=inpaint_x4_type,
         inpainting_dict=inpainting_dict,
+        x1_global_prop_t=x1_global_prop_t,
+        cfg_weight=cfg_weight
     )
-
-    pbar = tqdm(total=len(time_steps) -1 + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
+    if verbose:
+        pbar = tqdm(total=len(time_steps) -1 + sum(harmonize_jumps) * int(harmonize), position=0, leave=True, miniters=80, mininterval=1000)
+    else:
+        pbar = None
     
     current_time_idx = start_t_ind
     while current_time_idx < len(time_steps) - 1:
@@ -607,60 +634,9 @@ def inference_sample(
         x4_x_t = next_state['x4_x_t_1']
         noise_dict = next_state['noise_dict']
 
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
  
-    # ####### Extracting final structures, and re-scaling ########
-    
-    # x2_pos_final = x2_pos_t[~virtual_node_mask_x2].numpy()
-
-    # x3_pos_final = x3_pos_t[~virtual_node_mask_x3].numpy()
-    # x3_x_final = x3_x_t[~virtual_node_mask_x3].numpy()
-    # x3_x_final = x3_x_final / params['dataset']['x3']['scale_node_features']
-    
-    # x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4] - params['dataset']['x4']['scale_node_features']), axis = -1)
-    # x4_x_final = x4_x_final - 1 # readjusting for the previous addition of the virtual node pharmacophore type
-    # x4_pos_final = x4_pos_t[~virtual_node_mask_x4].numpy()
-    
-    # x4_direction_final = x4_direction_t[~virtual_node_mask_x4].numpy() / params['dataset']['x4']['scale_vector_features']
-    # x4_direction_final_norm = np.linalg.norm(x4_direction_final, axis = 1)
-    # x4_direction_final[x4_direction_final_norm < 0.5] = 0.0
-    # x4_direction_final[x4_direction_final_norm >= 0.5] = x4_direction_final[x4_direction_final_norm >= 0.5] / x4_direction_final_norm[x4_direction_final_norm >= 0.5][..., None]
-    
-    
-    # x1_x_t[~virtual_node_mask_x1, 0] = -np.inf # this masks out remaining probability assigned to virtual nodes
-    # x1_pos_final = x1_pos_t[~virtual_node_mask_x1].numpy()
-    # x1_x_final = np.argmin(np.abs(x1_x_t[~virtual_node_mask_x1, 0:-len(params['dataset']['x1']['charge_types'])] - params['dataset']['x1']['scale_atom_features']), axis = -1)
-    # x1_bond_edge_x_final = np.argmin(np.abs(x1_bond_edge_x_t - params['dataset']['x1']['scale_bond_features']), axis = -1)
-    
-    # # need to remap the indices in x1_x_final to the list of atom types
-    # atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14]) # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
-    # x1_x_final = atomic_number_remapping[x1_x_final]
-    
-    
-    # # return generated structures
-    # generated_structures = []
-    # for b in range(batch_size):
-    #     generated_dict = {
-    #         'x1': {
-    #             'atoms': np.split(x1_x_final.numpy(), batch_size)[b],
-    #             #'formal_charges': None, # still need to extract from x1_x_t[~virtual_node_mask_x1, -len(params['dataset']['x1']['charge_types']):]
-    #             'bonds': np.split(x1_bond_edge_x_final.numpy(), batch_size)[b],
-    #             'positions': np.split(x1_pos_final, batch_size)[b],
-    #         },
-    #         'x2': {
-    #             'positions': np.split(x2_pos_final, batch_size)[b],
-    #         },
-    #         'x3': {
-    #             'charges': np.split(x3_x_final, batch_size)[b], # electrostatic potential
-    #             'positions': np.split(x3_pos_final, batch_size)[b],
-    #         },
-    #         'x4': {
-    #             'types': np.split(x4_x_final.numpy(), batch_size)[b],
-    #             'positions': np.split(x4_pos_final, batch_size)[b],
-    #             'directions': np.split(x4_direction_final, batch_size)[b],
-    #         },
-    #     }
-    #     generated_structures.append(generated_dict)
     
     generated_structures = _extract_generated_samples(
         x1_x_t, x1_pos_t, x1_bond_edge_x_t, virtual_node_mask_x1,
